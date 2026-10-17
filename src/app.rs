@@ -601,10 +601,12 @@ impl App {
                 book.glide(From::Rect(here), MOVE_SECS);
             }
         }
-        if fullscreen || (escape && ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))) {
-            let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
+        // Échap : sort du plein écran, sinon ferme l'album.
+        let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if fullscreen || (escape && is_fullscreen) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
         }
+        let mut close = close || (escape && !is_fullscreen);
         let moved = book.position.page != before.page || book.position.panel != before.panel;
         if moved || toggle {
             self.hud_until = now + HUD_SECS;
@@ -742,7 +744,7 @@ impl App {
             );
             painter.rect_filled(pill, 14.0, Color32::from_black_alpha(200));
             painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
-            let hint = "Flèches ou clic  case suivante    Barre du bas  aller à une page    P  page entière    F  plein écran    ⌘ W  fermer";
+            let hint = "Flèches ou clic  case suivante    Barre du bas  aller à une page    P  page entière    F  plein écran    Échap  accueil";
             painter.text(
                 pos2(area.center().x, area.bottom() - 22.0),
                 Align2::CENTER_BOTTOM,
@@ -751,6 +753,32 @@ impl App {
                 Color32::from_gray(110),
             );
             ctx.request_repaint_after(Duration::from_secs_f64((self.hud_until - now).max(0.05)));
+        }
+
+        // Le retour à l'accueil, en haut à gauche, quand on bouge la souris.
+        if now < self.hud_until {
+            let button = Rect::from_min_size(area.min + vec2(14.0, 14.0), vec2(108.0, 30.0));
+            let back = ui.interact(button, ui.id().with("accueil"), Sense::click());
+            let fill = if back.hovered() { 235 } else { 190 };
+            painter.rect_filled(button, 15.0, Color32::from_black_alpha(fill));
+            // La flèche dessinée : la police n'a pas « ← ».
+            let tip = pos2(button.left() + 16.0, button.center().y);
+            let stroke = egui::Stroke::new(1.6, Color32::WHITE);
+            painter.line_segment([tip, tip + vec2(12.0, 0.0)], stroke);
+            painter.line_segment([tip, tip + vec2(5.0, -5.0)], stroke);
+            painter.line_segment([tip, tip + vec2(5.0, 5.0)], stroke);
+            painter.text(
+                pos2(button.left() + 38.0, button.center().y),
+                Align2::LEFT_CENTER,
+                "Accueil",
+                FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+            if back.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                self.hud_until = self.hud_until.max(now + 1.0);
+            }
+            close |= back.clicked();
         }
 
         if close {

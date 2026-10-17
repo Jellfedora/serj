@@ -279,7 +279,11 @@ mod tests {
     #[test]
     fn finds_panels_in_reading_order() {
         // Une grande case en haut, deux en bas.
-        let boxes = [r(40, 40, 760, 500), r(40, 540, 380, 1060), r(420, 540, 760, 1060)];
+        let boxes = [
+            r(40, 40, 760, 500),
+            r(40, 540, 380, 1060),
+            r(420, 540, 760, 1060),
+        ];
         let found = detect(800, 1100, &page(800, 1100, &boxes), false);
         assert_eq!(found, boxes);
     }
