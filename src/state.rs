@@ -14,9 +14,34 @@ pub struct Position {
     /// Pages de l'album et part lue (0 à 1), pour l'accueil.
     pub pages: usize,
     pub progress: f32,
+    /// Manga : pages lues de la dernière à la première, cases de droite à gauche.
+    pub manga: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+impl Position {
+    /// Rang de `page` dans l'ordre de lecture (et inversement : la page d'un
+    /// rang) ; à l'envers pour un manga.
+    pub fn rank(&self, page: usize) -> usize {
+        if self.manga && self.pages > 0 {
+            self.pages - 1 - page.min(self.pages - 1)
+        } else {
+            page
+        }
+    }
+
+    /// Passe en manga (ou en BD). Au tout début de l'album, on va au début dans
+    /// le nouveau sens ; renvoie vrai dans ce cas.
+    pub fn set_manga(&mut self, on: bool) -> bool {
+        let at_start = self.rank(self.page) == 0 && self.panel == 0;
+        self.manga = on;
+        if at_start {
+            self.page = self.rank(0);
+        }
+        at_start
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
     /// Albums ouverts, le plus récent d'abord.
@@ -26,6 +51,20 @@ pub struct State {
     pub whole_page: bool,
     /// Dossiers dont les PDF sont montrés dans la bibliothèque de l'accueil.
     pub folders: Vec<PathBuf>,
+    /// Lecture automatique : secondes avant de passer à la case (ou page) suivante.
+    pub auto_secs: f64,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            recents: Vec::new(),
+            positions: BTreeMap::new(),
+            whole_page: false,
+            folders: Vec::new(),
+            auto_secs: 5.0,
+        }
+    }
 }
 
 const MAX_RECENTS: usize = 12;

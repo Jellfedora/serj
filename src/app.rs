@@ -13,12 +13,7 @@ use egui::{
 use crate::library;
 use crate::loader::{Event, LoadedPage, Loader};
 use crate::state::{Position, State};
-
-const BACKGROUND: Color32 = Color32::from_rgb(18, 18, 20);
-/// Le reste de la planche, autour de la case lue : à peine visible.
-const DIM: Color32 = Color32::from_rgba_premultiplied(18, 18, 20, 232);
-const ACCENT: Color32 = Color32::from_rgb(240, 196, 92);
-const MUTED: Color32 = Color32::from_rgb(140, 140, 150);
+use crate::widgets::{self, ACCENT, BACKGROUND, DIM, Icon, MUTED, ON_ACCENT, SURFACE, TEXT, Tone};
 
 /// Durée du glissement d'une case à l'autre, et du zoom en arrivant sur une page.
 const MOVE_SECS: f64 = 0.38;
@@ -27,8 +22,12 @@ const ENTER_SECS: f64 = 0.55;
 const SCREEN_MARGIN: f32 = 20.0;
 /// Pages gardées de part et d'autre de la page lue.
 const KEEP_AROUND: usize = 2;
-/// Combien de temps l'indication « Page · Case » reste visible.
+/// Combien de temps les commandes et l'indication « Page · Case » restent visibles.
 const HUD_SECS: f64 = 2.2;
+/// Délais proposés pour la lecture automatique, en secondes.
+const AUTO_STEPS: [f64; 12] = [
+    2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0,
+];
 
 struct Page {
     texture: TextureHandle,
@@ -71,6 +70,39 @@ struct Book {
     error: Option<String>,
 }
 
+/// Ce que demandent le clavier, la souris, la barre d'outils ou la lecture
+/// automatique, appliqué en un seul endroit.
+#[derive(Default)]
+struct Actions {
+    next: bool,
+    previous: bool,
+    first: bool,
+    last: bool,
+    jump: Option<usize>,
+    toggle_page: bool,
+    toggle_manga: bool,
+    toggle_auto: bool,
+    /// Moins (ou plus) de temps par case en lecture automatique.
+    faster: bool,
+    slower: bool,
+    fullscreen: bool,
+    close: bool,
+    /// Pas de la lecture automatique : sans montrer les commandes.
+    auto: bool,
+}
+
+/// Ce que l'on a cliqué dans l'accueil.
+#[derive(Default)]
+struct Clicks {
+    open: Option<PathBuf>,
+    pick: bool,
+    add_folder: bool,
+    remove_folder: Option<PathBuf>,
+    forget: Option<PathBuf>,
+    restart: Option<PathBuf>,
+    manga: Option<PathBuf>,
+}
+
 pub struct App {
     state: State,
     book: Option<Book>,
@@ -79,6 +111,9 @@ pub struct App {
     state_dirty_since: Option<f64>,
     shots: Option<crate::shots::Shots>,
     auto_next: bool,
+    /// Lecture automatique en cours, et depuis quand la case est à l'écran.
+    auto_play: bool,
+    auto_since: Option<f64>,
     library: library::Library,
     /// Les albums de l'accueil, et quand ils ont été cherchés.
     books: Vec<PathBuf>,
@@ -87,10 +122,7 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = BACKGROUND;
-        visuals.window_fill = BACKGROUND;
-        cc.egui_ctx.set_visuals(visuals);
+        widgets::install(&cc.egui_ctx);
 
         let mut app = Self {
             state: State::load(),
@@ -100,6 +132,8 @@ impl App {
             state_dirty_since: None,
             shots: crate::shots::Shots::from_env(),
             auto_next: false,
+            auto_play: false,
+            auto_since: None,
             library: library::Library::new(cc.egui_ctx.clone()),
             books: Vec::new(),
             books_at: None,
@@ -122,16 +156,13 @@ impl App {
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.save_position();
-        let title = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Album".into());
+        let title = title(&path);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{title} — Serj")));
         self.state.opened(&path);
         self.state.save();
         let position = self.state.position(&path);
         self.book = Some(Book {
-            loader: Loader::open(path.clone(), ctx.clone()),
+            loader: Loader::open(path.clone(), position.manga, ctx.clone()),
             path,
             page_count: None,
             pages: HashMap::new(),
@@ -144,12 +175,15 @@ impl App {
             }),
             error: None,
         });
+        self.auto_play = false;
+        self.auto_since = None;
         self.hud_until = ctx.input(|i| i.time) + HUD_SECS;
     }
 
     fn close(&mut self, ctx: &egui::Context) {
         self.save_position();
         self.book = None;
+        self.auto_play = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Title("Serj".into()));
     }
 
@@ -166,21 +200,24 @@ impl App {
     fn save_position(&mut self) {
         if let Some(book) = &self.book {
             self.state.set_position(&book.path, book.position);
-            self.state.save();
         }
+        self.state.save();
         self.state_dirty_since = None;
     }
 }
 
 impl Book {
-    fn receive(&mut self, ctx: &egui::Context) {
+    fn receive(&mut self, ctx: &egui::Context, whole_page: bool) {
         while let Ok(event) = self.loader.events.try_recv() {
             match event {
                 Event::Opened { pages } => {
+                    let fresh = self.position.pages == 0;
                     self.page_count = Some(pages);
                     self.position.pages = pages;
-                    if self.position.page >= pages {
-                        self.position.page = 0;
+                    // Un album jamais lu commence à son début : la dernière
+                    // page pour un manga.
+                    if fresh || self.position.page >= pages {
+                        self.position.page = self.position.rank(0);
                         self.position.panel = 0;
                     }
                 }
@@ -188,20 +225,30 @@ impl Book {
                 Event::Page(page) => {
                     let index = page.index;
                     let page = upload(ctx, page);
+                    // Page rendue de nouveau (le sens de lecture a changé) : la
+                    // caméra glisse de l'ancienne case vers la nouvelle.
+                    if index == self.position.page
+                        && self.camera_move.is_none()
+                        && let Some(old) = self.pages.get(&index)
+                    {
+                        let from = self.target(old, whole_page);
+                        self.glide(From::Rect(from), MOVE_SECS);
+                    }
                     self.pages.insert(index, page);
                 }
             }
         }
         if let Some(count) = self.page_count {
             // La page lue d'abord, puis la suivante, puis la précédente, etc.
-            let p = self.position.page;
-            let mut wanted = vec![p];
+            // (dans l'ordre de lecture).
+            let r = self.position.rank(self.position.page);
+            let mut wanted = vec![self.position.page];
             for d in 1..=KEEP_AROUND {
-                if p + d < count {
-                    wanted.push(p + d);
+                if r + d < count {
+                    wanted.push(self.position.rank(r + d));
                 }
-                if let Some(back) = p.checked_sub(d) {
-                    wanted.push(back);
+                if let Some(back) = r.checked_sub(d) {
+                    wanted.push(self.position.rank(back));
                 }
             }
             let far: Vec<usize> = self
@@ -230,7 +277,7 @@ impl Book {
     /// cases lues dans la page en cours.
     fn progress(&self, whole_page: bool) -> Option<f32> {
         let count = self.page_count.filter(|&c| c > 0)? as f32;
-        let page = self.position.page as f32;
+        let page = self.position.rank(self.position.page) as f32;
         let in_page = match self.panel_count() {
             Some(n) if !whole_page => (self.position.panel.min(n - 1) + 1) as f32 / n as f32,
             _ => 1.0,
@@ -275,69 +322,14 @@ impl Book {
         });
     }
 
-    fn next(&mut self, now: f64, whole_page: bool) {
-        let (Some(count), Some(panels)) = (self.page_count, self.panel_count()) else {
-            return;
-        };
-        let here = self.camera(now, whole_page);
-        if !whole_page && self.position.panel + 1 < panels {
-            self.position.panel += 1;
-            if let Some(here) = here {
-                self.glide(From::Rect(here), MOVE_SECS);
-            }
-        } else if self.position.page + 1 < count {
-            self.position = Position {
-                page: self.position.page + 1,
-                panel: 0,
-                ..self.position
-            };
-            self.to_last_panel = false;
-            self.camera_move = if whole_page {
-                None
-            } else {
-                Some(Move {
-                    from: From::WholePage,
-                    start: None,
-                    secs: ENTER_SECS,
-                })
-            };
-        }
-    }
-
-    fn previous(&mut self, now: f64, whole_page: bool) {
-        let here = self.camera(now, whole_page);
-        if !whole_page && self.position.panel > 0 && self.current().is_some() {
-            self.position.panel -= 1;
-            if let Some(here) = here {
-                self.glide(From::Rect(here), MOVE_SECS);
-            }
-        } else if self.position.page > 0 {
-            self.position = Position {
-                page: self.position.page - 1,
-                panel: 0,
-                ..self.position
-            };
-            self.to_last_panel = !whole_page;
-            self.camera_move = if whole_page {
-                None
-            } else {
-                Some(Move {
-                    from: From::WholePage,
-                    start: None,
-                    secs: ENTER_SECS,
-                })
-            };
-        }
-    }
-
-    fn go_to_page(&mut self, page: usize, whole_page: bool) {
-        let Some(count) = self.page_count else { return };
+    /// Arrive sur la page `page` (indice dans le PDF).
+    fn enter(&mut self, page: usize, to_last_panel: bool, whole_page: bool) {
         self.position = Position {
-            page: page.min(count.saturating_sub(1)),
+            page,
             panel: 0,
             ..self.position
         };
-        self.to_last_panel = false;
+        self.to_last_panel = to_last_panel;
         self.camera_move = if whole_page {
             None
         } else {
@@ -347,6 +339,56 @@ impl Book {
                 secs: ENTER_SECS,
             })
         };
+    }
+
+    fn next(&mut self, now: f64, whole_page: bool) {
+        let (Some(count), Some(panels)) = (self.page_count, self.panel_count()) else {
+            return;
+        };
+        let here = self.camera(now, whole_page);
+        let rank = self.position.rank(self.position.page);
+        if !whole_page && self.position.panel + 1 < panels {
+            self.position.panel += 1;
+            if let Some(here) = here {
+                self.glide(From::Rect(here), MOVE_SECS);
+            }
+        } else if rank + 1 < count {
+            self.enter(self.position.rank(rank + 1), false, whole_page);
+        }
+    }
+
+    fn previous(&mut self, now: f64, whole_page: bool) {
+        let here = self.camera(now, whole_page);
+        let rank = self.position.rank(self.position.page);
+        if !whole_page && self.position.panel > 0 && self.current().is_some() {
+            self.position.panel -= 1;
+            if let Some(here) = here {
+                self.glide(From::Rect(here), MOVE_SECS);
+            }
+        } else if rank > 0 {
+            self.enter(self.position.rank(rank - 1), !whole_page, whole_page);
+        }
+    }
+
+    fn go_to_page(&mut self, page: usize, whole_page: bool) {
+        let Some(count) = self.page_count else { return };
+        self.enter(page.min(count.saturating_sub(1)), false, whole_page);
+    }
+
+    /// Lecture en manga ou en BD. Les cases de la planche sont redétectées dans
+    /// le nouvel ordre.
+    fn set_manga(&mut self, on: bool, now: f64, whole_page: bool) {
+        let here = self.camera(now, whole_page);
+        let at_start = self.position.set_manga(on);
+        self.loader.right_to_left(on);
+        if at_start {
+            self.enter(self.position.page, false, whole_page);
+        } else {
+            self.position.panel = 0;
+            if let Some(here) = here {
+                self.glide(From::Rect(here), MOVE_SECS);
+            }
+        }
     }
 }
 
@@ -456,146 +498,218 @@ impl App {
             self.books = library::books(&self.state.recents, &self.state.folders);
             self.books_at = Some(now);
         }
-        let pad = if area.width() > 700.0 { 40.0 } else { 16.0 };
+        let pad = if area.width() > 700.0 { 44.0 } else { 18.0 };
         let column = Rect::from_min_max(area.min + vec2(pad, 0.0), area.max - vec2(pad, 0.0));
-        let (mut open, mut pick, mut add_folder) = (None, false, false);
-        let (mut remove_folder, mut forget, mut restart) = (None, None, None);
+        let mut clicks = Clicks::default();
         ui.scope_builder(egui::UiBuilder::new().max_rect(column), |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.add_space(26.0);
+                    ui.add_space(30.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Serj").size(34.0).strong().color(ACCENT));
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("Lecteur de BD, case par case")
-                                .size(14.0)
-                                .color(MUTED),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let button = |text: &str| {
-                                egui::Button::new(egui::RichText::new(text).size(14.0))
-                                    .min_size(vec2(0.0, 32.0))
-                                    .corner_radius(8.0)
-                            };
-                            add_folder |= ui.add(button("Ajouter un dossier…")).clicked();
-                            pick |= ui.add(button("Ouvrir un PDF…   ⌘ O")).clicked();
-                        });
-                    });
-                    if !self.state.folders.is_empty() {
-                        ui.add_space(10.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new("Dossiers").size(12.0).color(MUTED));
-                            for folder in &self.state.folders {
-                                let name = folder
-                                    .file_name()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| folder.display().to_string());
-                                ui.label(egui::RichText::new(name).size(12.0))
-                                    .on_hover_text(folder.display().to_string());
-                                if ui
-                                    .add(egui::Button::new(egui::RichText::new("×").size(13.0)).frame(false))
-                                    .on_hover_text("Retirer ce dossier de la bibliothèque")
-                                    .clicked()
-                                {
-                                    remove_folder = Some(folder.clone());
-                                }
-                                ui.add_space(8.0);
-                            }
-                        });
-                    }
-                    ui.add_space(24.0);
-
-                    if self.books.is_empty() {
-                        ui.add_space(60.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(egui::RichText::new("Ta bibliothèque est vide").size(20.0));
-                            ui.add_space(6.0);
+                        ui.vertical(|ui| {
                             ui.label(
-                                egui::RichText::new(
-                                    "Ouvre un PDF, glisse-le dans la fenêtre, ou ajoute le dossier où sont tes BD.",
-                                )
-                                .color(MUTED),
+                                egui::RichText::new("Serj")
+                                    .size(32.0)
+                                    .strong()
+                                    .color(ACCENT),
+                            );
+                            ui.label(
+                                egui::RichText::new("Tes BD, case par case")
+                                    .size(14.0)
+                                    .color(MUTED),
                             );
                         });
-                        return;
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let compact = ui.available_width() < 380.0;
+                            let label = |full: &'static str| if compact { "" } else { full };
+                            clicks.add_folder |= widgets::button(
+                                ui,
+                                Some(Icon::Folder),
+                                label("Ajouter un dossier"),
+                                Tone::Plain,
+                            )
+                            .on_hover_text("Montrer ici tous les PDF d'un dossier")
+                            .clicked();
+                            clicks.pick |= widgets::button(
+                                ui,
+                                Some(Icon::Plus),
+                                label("Ouvrir un PDF"),
+                                Tone::Primary,
+                            )
+                            .on_hover_text("⌘ O, ou glisse un PDF dans la fenêtre")
+                            .clicked();
+                        });
+                    });
+
+                    if !self.state.folders.is_empty() {
+                        ui.add_space(16.0);
+                        self.folder_chips(ui, &mut clicks);
                     }
 
-                    // La grille des albums, centrée.
-                    let (card_w, gap) = (156.0_f32, 26.0_f32);
-                    let width = ui.available_width();
-                    let cols = (((width + gap) / (card_w + gap)).floor() as usize).max(1);
-                    let used = cols as f32 * card_w + (cols - 1) as f32 * gap;
-                    let indent = ((width - used) / 2.0).max(0.0);
-                    for row in self.books.clone().chunks(cols) {
-                        ui.horizontal(|ui| {
-                            ui.add_space(indent);
-                            ui.spacing_mut().item_spacing.x = gap;
-                            for path in row {
-                                let card = self.book_card(ui, path, card_w);
-                                if card.clicked() {
-                                    open = Some(path.clone());
-                                }
-                                let recent = self.state.recents.contains(path);
-                                let started = self.state.position(path).pages > 0;
-                                card.context_menu(|ui| {
-                                    if started && ui.button("Recommencer au début").clicked() {
-                                        restart = Some(path.clone());
-                                    }
-                                    if recent && ui.button("Retirer des récents").clicked() {
-                                        forget = Some(path.clone());
-                                    }
-                                    if !recent && !started {
-                                        ui.label(egui::RichText::new("Clic pour lire").color(MUTED));
-                                    }
-                                });
-                            }
-                        });
-                        ui.add_space(22.0);
+                    if self.books.is_empty() {
+                        empty_library(ui);
+                        return;
                     }
+                    let (reading, rest): (Vec<PathBuf>, Vec<PathBuf>) =
+                        self.books.iter().cloned().partition(|p| {
+                            let pos = self.state.position(p);
+                            pos.pages > 0 && pos.progress < 0.999
+                        });
+                    if !reading.is_empty() {
+                        self.shelf(ui, "En cours", &reading, &mut clicks);
+                    }
+                    if !rest.is_empty() {
+                        self.shelf(ui, "Bibliothèque", &rest, &mut clicks);
+                    }
+                    ui.add_space(20.0);
                 });
         });
-        if pick {
+
+        if clicks.pick {
             self.pick_file(ctx);
         }
-        if add_folder && let Some(folder) = rfd::FileDialog::new().pick_folder() {
+        if clicks.add_folder
+            && let Some(folder) = rfd::FileDialog::new().pick_folder()
+        {
             if !self.state.folders.contains(&folder) {
                 self.state.folders.push(folder);
             }
             self.state.save();
             self.books_at = None;
         }
-        if let Some(folder) = remove_folder {
+        if let Some(folder) = clicks.remove_folder {
             self.state.folders.retain(|f| *f != folder);
             self.state.save();
             self.books_at = None;
         }
-        if let Some(path) = forget {
+        if let Some(path) = clicks.forget {
             self.state.recents.retain(|p| *p != path);
             self.state.save();
             self.books_at = None;
         }
-        if let Some(path) = restart {
-            self.state.set_position(&path, Position::default());
+        if let Some(path) = clicks.restart {
+            let manga = self.state.position(&path).manga;
+            self.state.set_position(
+                &path,
+                Position {
+                    manga,
+                    ..Position::default()
+                },
+            );
             self.state.save();
         }
-        if let Some(path) = open {
+        if let Some(path) = clicks.manga {
+            let mut pos = self.state.position(&path);
+            pos.set_manga(!pos.manga);
+            self.state.set_position(&path, pos);
+            self.state.save();
+        }
+        if let Some(path) = clicks.open {
             self.open(ctx, path);
+        }
+    }
+
+    /// Les dossiers de la bibliothèque, en pastilles qu'on peut retirer.
+    fn folder_chips(&self, ui: &mut egui::Ui, clicks: &mut Clicks) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            for folder in &self.state.folders {
+                let name = folder
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| folder.display().to_string());
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .corner_radius(14)
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        right: 4,
+                        top: 3,
+                        bottom: 3,
+                    })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.label(egui::RichText::new(name).size(12.5).color(TEXT))
+                            .on_hover_text(folder.display().to_string());
+                        let remove = ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("×").size(14.0).color(MUTED))
+                                    .frame(false),
+                            )
+                            .on_hover_text("Retirer ce dossier de la bibliothèque");
+                        if remove.clicked() {
+                            clicks.remove_folder = Some(folder.clone());
+                        }
+                    });
+            }
+        });
+    }
+
+    /// Une rangée de la bibliothèque : un titre, puis la grille des albums.
+    fn shelf(&mut self, ui: &mut egui::Ui, title: &str, books: &[PathBuf], clicks: &mut Clicks) {
+        ui.add_space(30.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).size(18.0).strong().color(TEXT));
+            ui.label(
+                egui::RichText::new(books.len().to_string())
+                    .size(13.0)
+                    .color(MUTED),
+            );
+        });
+        ui.add_space(14.0);
+
+        // Les cartes s'élargissent pour remplir la rangée.
+        let (min_w, gap) = (150.0_f32, 26.0_f32);
+        let width = ui.available_width();
+        let cols = (((width + gap) / (min_w + gap)).floor() as usize).max(1);
+        let card_w = ((width - (cols - 1) as f32 * gap) / cols as f32).min(220.0);
+        for row in books.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for path in row {
+                    let card = self.book_card(ui, path, card_w);
+                    if card.clicked() {
+                        clicks.open = Some(path.clone());
+                    }
+                    let recent = self.state.recents.contains(path);
+                    let pos = self.state.position(path);
+                    card.context_menu(|ui| {
+                        if ui.button("Lire").clicked() {
+                            clicks.open = Some(path.clone());
+                        }
+                        let manga = if pos.manga {
+                            "Lire comme une BD"
+                        } else {
+                            "Lire comme un manga"
+                        };
+                        if ui.button(manga).clicked() {
+                            clicks.manga = Some(path.clone());
+                        }
+                        if pos.pages > 0 && ui.button("Recommencer au début").clicked() {
+                            clicks.restart = Some(path.clone());
+                        }
+                        if recent && ui.button("Retirer des récents").clicked() {
+                            clicks.forget = Some(path.clone());
+                        }
+                    });
+                }
+            });
+            ui.add_space(gap);
         }
     }
 
     /// Une carte de la bibliothèque : la couverture, le titre, où on en est.
     fn book_card(&mut self, ui: &mut egui::Ui, path: &Path, width: f32) -> egui::Response {
-        let cover_h = width * 1.4;
-        let (rect, response) = ui.allocate_exact_size(vec2(width, cover_h + 62.0), Sense::click());
+        let cover_h = width * 1.42;
+        let (rect, response) = ui.allocate_exact_size(vec2(width, cover_h + 58.0), Sense::click());
         let hovered = response.hovered();
         if hovered {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        let painter = ui.painter_at(rect.expand(6.0));
-        let lift = if hovered { -4.0 } else { 0.0 };
-        let slot = Rect::from_min_size(rect.min + vec2(0.0, lift), vec2(width, cover_h));
+        let lift = ui.ctx().animate_bool_with_time(response.id, hovered, 0.12);
+        let painter = ui.painter_at(rect.expand(20.0));
+        let slot = Rect::from_min_size(rect.min - vec2(0.0, 5.0 * lift), vec2(width, cover_h));
         let cover_rect = match self.library.cover(path) {
             library::Cover::Ready(texture) => {
                 // La couverture entière, posée en bas de sa place.
@@ -606,19 +720,21 @@ impl App {
                     pos2(slot.center().x - fitted.x / 2.0, slot.bottom() - fitted.y),
                     fitted,
                 );
-                painter.rect_filled(
-                    r.translate(vec2(0.0, 6.0)).expand(2.0),
-                    8.0,
-                    Color32::from_black_alpha(90),
-                );
+                let shadow = egui::epaint::Shadow {
+                    offset: [0, 6 + (6.0 * lift) as i8],
+                    blur: 18 + (10.0 * lift) as u8,
+                    spread: 0,
+                    color: Color32::from_black_alpha(150),
+                };
+                painter.add(shadow.as_shape(r, 8));
                 egui::Image::from_texture((texture.id(), size))
-                    .corner_radius(6.0)
+                    .corner_radius(8.0)
                     .paint_at(ui, r);
                 r
             }
             cover => {
                 let failed = matches!(cover, library::Cover::Failed);
-                painter.rect_filled(slot, 6.0, Color32::from_gray(38));
+                painter.rect_filled(slot, 8.0, SURFACE);
                 let text = if failed { "PDF illisible" } else { "…" };
                 painter.text(
                     slot.center(),
@@ -630,160 +746,143 @@ impl App {
                 slot
             }
         };
-        if hovered {
+        if lift > 0.0 {
             painter.rect_stroke(
                 cover_rect,
-                6.0,
-                egui::Stroke::new(2.0, ACCENT),
+                8.0,
+                egui::Stroke::new(2.0, ACCENT.gamma_multiply(lift)),
                 egui::StrokeKind::Outside,
             );
         }
 
-        // Où on en est : une barre sous la couverture.
+        // Où on en est : une étiquette, ou une barre au pied de la couverture.
         let pos = self.state.position(path);
         let started = pos.pages > 0;
-        if started {
-            let track =
-                Rect::from_min_size(pos2(rect.left(), slot.bottom() + 8.0), vec2(width, 3.0));
+        let finished = started && pos.progress >= 0.999;
+        let mut at = cover_rect.min + vec2(8.0, 8.0);
+        if !started {
+            at.x = widgets::badge(&painter, at, "Nouveau", ACCENT, ON_ACCENT).right() + 6.0;
+        } else if finished {
+            let fill = Color32::from_black_alpha(200);
+            at.x = widgets::badge(&painter, at, "Terminé", fill, TEXT).right() + 6.0;
+        }
+        if pos.manga {
+            widgets::badge(&painter, at, "Manga", Color32::from_black_alpha(200), TEXT);
+        }
+        if started && !finished {
+            let track = Rect::from_min_max(
+                pos2(cover_rect.left() + 8.0, cover_rect.bottom() - 12.0),
+                pos2(cover_rect.right() - 8.0, cover_rect.bottom() - 8.0),
+            );
             let mut done = track;
             done.max.x = track.left() + track.width() * pos.progress.clamp(0.0, 1.0);
-            painter.rect_filled(track, 1.5, Color32::from_gray(50));
-            painter.rect_filled(done, 1.5, ACCENT);
+            painter.rect_filled(track.expand(1.0), 3.0, Color32::from_black_alpha(170));
+            painter.rect_filled(done, 2.0, ACCENT);
         }
 
         // Le titre, sur deux lignes au plus.
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let mut job = egui::text::LayoutJob::simple(
-            name,
-            FontId::proportional(13.0),
+            title(path),
+            FontId::proportional(13.5),
             if hovered {
                 Color32::WHITE
             } else {
-                Color32::from_gray(215)
+                Color32::from_gray(220)
             },
             width,
         );
         job.wrap.max_rows = 2;
-        let title = ui.fonts_mut(|f| f.layout_job(job));
-        let title_h = title.size().y;
-        painter.galley(
-            pos2(rect.left(), slot.bottom() + 16.0),
-            title,
-            Color32::WHITE,
-        );
-        let (status, color) = if !started {
-            ("Nouveau".to_string(), ACCENT)
-        } else if pos.progress >= 0.999 {
-            ("Terminé".to_string(), MUTED)
-        } else {
-            (
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        let title_h = galley.size().y;
+        painter.galley(pos2(rect.left(), slot.bottom() + 10.0), galley, TEXT);
+        if started && !finished {
+            painter.text(
+                pos2(rect.left(), slot.bottom() + 14.0 + title_h),
+                Align2::LEFT_TOP,
                 format!(
-                    "{}   ·   page {} / {}",
-                    percent(pos.progress),
-                    pos.page + 1,
-                    pos.pages
+                    "Page {} / {}   ·   {}",
+                    pos.rank(pos.page) + 1,
+                    pos.pages,
+                    percent(pos.progress)
                 ),
+                FontId::proportional(11.5),
                 MUTED,
-            )
-        };
-        painter.text(
-            pos2(rect.left(), slot.bottom() + 20.0 + title_h),
-            Align2::LEFT_TOP,
-            status,
-            FontId::proportional(11.5),
-            color,
-        );
+            );
+        }
         response.on_hover_text(path.display().to_string())
     }
 
     fn reading(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, now: f64) {
         let whole_page = self.state.whole_page;
-        let book = self.book.as_mut().expect("album ouvert");
-        book.receive(ctx);
+        self.book
+            .as_mut()
+            .expect("album ouvert")
+            .receive(ctx, whole_page);
 
-        // Clavier.
-        let (next, previous, toggle, first, last, fullscreen, escape, close) = ctx.input_mut(|i| {
+        // Clavier, souris, molette.
+        let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let mut input = ctx.input_mut(|i| {
             let shift_space = i.consume_key(egui::Modifiers::SHIFT, Key::Space);
             let mut any = |keys: &[Key]| {
                 keys.iter().fold(false, |hit, k| {
                     i.consume_key(egui::Modifiers::NONE, *k) | hit
                 })
             };
-            (
-                any(&[
+            let escape = any(&[Key::Escape]);
+            Actions {
+                next: any(&[
                     Key::ArrowRight,
                     Key::ArrowDown,
                     Key::Space,
                     Key::PageDown,
                     Key::Enter,
                 ]),
-                any(&[Key::ArrowLeft, Key::ArrowUp, Key::PageUp, Key::Backspace]) || shift_space,
-                any(&[Key::P]),
-                any(&[Key::Home]),
-                any(&[Key::End]),
-                any(&[Key::F]),
-                any(&[Key::Escape]),
-                i.consume_key(egui::Modifiers::COMMAND, Key::W),
-            )
+                previous: any(&[Key::ArrowLeft, Key::ArrowUp, Key::PageUp, Key::Backspace])
+                    || shift_space,
+                first: any(&[Key::Home]),
+                last: any(&[Key::End]),
+                toggle_page: any(&[Key::P]),
+                toggle_manga: any(&[Key::M]),
+                toggle_auto: any(&[Key::A]),
+                faster: any(&[Key::Minus]),
+                slower: any(&[Key::Plus, Key::Equals]),
+                // Échap : sort du plein écran, sinon ferme l'album.
+                fullscreen: any(&[Key::F]) || (escape && is_fullscreen),
+                close: i.consume_key(egui::Modifiers::COMMAND, Key::W)
+                    || (escape && !is_fullscreen),
+                ..Actions::default()
+            }
         });
-
-        // Souris : clic à droite pour avancer, à gauche pour reculer ; molette.
+        // Clic à droite pour avancer, à gauche pour reculer.
         let response = ui.interact(area, ui.id().with("lecture"), Sense::click());
-        let mut click_next = false;
-        let mut click_previous = false;
         if response.clicked()
             && let Some(p) = response.interact_pointer_pos()
         {
             if p.x > area.left() + area.width() / 3.0 {
-                click_next = true;
+                input.next = true;
             } else {
-                click_previous = true;
+                input.previous = true;
             }
         }
         let wheel = ctx.input(|i| i.smooth_scroll_delta.y);
         self.scroll += wheel;
-        let mut wheel_step = 0;
         if self.scroll.abs() > 90.0 {
-            wheel_step = if self.scroll < 0.0 { 1 } else { -1 };
+            if self.scroll < 0.0 {
+                input.next = true;
+            } else {
+                input.previous = true;
+            }
             self.scroll = 0.0;
         }
         if wheel == 0.0 {
             self.scroll *= 0.8;
         }
-
-        let before = book.position;
-        if next || click_next || wheel_step > 0 || std::mem::take(&mut self.auto_next) {
-            book.next(now, whole_page);
+        input.next |= std::mem::take(&mut self.auto_next);
+        self.apply(ctx, input, now);
+        if self.book.is_none() {
+            return;
         }
-        if previous || click_previous || wheel_step < 0 {
-            book.previous(now, whole_page);
-        }
-        if first {
-            book.go_to_page(0, whole_page);
-        }
-        if last {
-            book.go_to_page(usize::MAX, whole_page);
-        }
-        if toggle {
-            self.state.whole_page = !whole_page;
-            if let Some(here) = book.camera(now, whole_page) {
-                book.glide(From::Rect(here), MOVE_SECS);
-            }
-        }
-        // Échap : sort du plein écran, sinon ferme l'album.
-        let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        if fullscreen || (escape && is_fullscreen) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
-        }
-        let mut close = close || (escape && !is_fullscreen);
-        let moved = book.position.page != before.page || book.position.panel != before.panel;
-        if moved || toggle {
-            self.hud_until = now + HUD_SECS;
-            self.state_dirty_since.get_or_insert(now);
-        }
+        let auto_part = self.autoplay(ctx, now);
         if ctx.input(|i| i.pointer.delta() != Vec2::ZERO) {
             self.hud_until = self.hud_until.max(now + 1.0);
         }
@@ -851,10 +950,12 @@ impl App {
             book.position.progress = progress;
         }
 
+        let mut actions = Actions::default();
         // La barre d'avancement, tout en bas : on y clique ou on la fait
-        // glisser pour sauter à une page.
-        let mut jump = None;
+        // glisser pour sauter à une page. Elle se remplit dans le sens de
+        // lecture : de droite à gauche pour un manga.
         if let (Some(count), Some(progress)) = (book.page_count, book.progress(whole_page)) {
+            let manga = book.position.manga;
             let zone = Rect::from_min_max(pos2(area.left(), area.bottom() - 18.0), area.max);
             let bar = ui.interact(zone, ui.id().with("avancement"), Sense::click_and_drag());
             let active = bar.hovered() || bar.dragged();
@@ -862,20 +963,24 @@ impl App {
             let track = Rect::from_min_max(pos2(area.left(), area.bottom() - height), area.max);
             painter.rect_filled(track, 0.0, Color32::from_gray(if active { 60 } else { 42 }));
             let mut done = track;
-            done.max.x = track.left() + track.width() * progress;
+            if manga {
+                done.min.x = track.right() - track.width() * progress;
+            } else {
+                done.max.x = track.left() + track.width() * progress;
+            }
             painter.rect_filled(done, 0.0, ACCENT);
             if active {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 self.hud_until = self.hud_until.max(now + 1.0);
             }
-            let page_at = |x: f32| {
-                let t = ((x - track.left()) / track.width()).clamp(0.0, 0.9999);
-                (t * count as f32) as usize
-            };
             if let Some(p) = bar.hover_pos().or(bar.interact_pointer_pos()) {
-                let target = page_at(p.x);
+                let mut t = ((p.x - track.left()) / track.width()).clamp(0.0, 0.9999);
+                if manga {
+                    t = 0.9999 - t;
+                }
+                let rank = (t * count as f32) as usize;
                 let label = painter.layout_no_wrap(
-                    format!("Page {}", target + 1),
+                    format!("Page {}", rank + 1),
                     FontId::proportional(13.0),
                     Color32::WHITE,
                 );
@@ -886,77 +991,343 @@ impl App {
                 );
                 painter.rect_filled(tip, 6.0, Color32::from_black_alpha(220));
                 painter.galley(tip.center() - label.size() / 2.0, label, Color32::WHITE);
+                let target = book.position.rank(rank);
                 if (bar.clicked() || bar.dragged()) && target != book.position.page {
-                    jump = Some(target);
+                    actions.jump = Some(target);
                 }
             }
         }
-        if let Some(page) = jump {
-            book.go_to_page(page, whole_page);
-            self.hud_until = now + HUD_SECS;
-            self.state_dirty_since.get_or_insert(now);
-        }
 
-        // Où on en est, un instant après chaque mouvement.
-        if now < self.hud_until
-            && let Some(count) = book.page_count
-        {
-            let mut text = format!("Page {} / {count}", book.position.page + 1);
-            if !whole_page && let Some(n) = book.panel_count() {
-                text += &format!("   ·   Case {} / {n}", book.position.panel.min(n - 1) + 1);
-            }
-            if let Some(progress) = book.progress(whole_page) {
-                text += &format!("   ·   {}", percent(progress));
-            }
-            let galley =
-                painter.layout_no_wrap(text, FontId::proportional(14.0), Color32::from_gray(225));
-            let pill = Rect::from_center_size(
-                pos2(area.center().x, area.bottom() - 52.0),
-                galley.size() + vec2(28.0, 12.0),
-            );
-            painter.rect_filled(pill, 14.0, Color32::from_black_alpha(200));
-            painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
-            let hint = "Flèches ou clic  case suivante    Barre du bas  aller à une page    P  page entière    F  plein écran    Échap  accueil";
-            painter.text(
-                pos2(area.center().x, area.bottom() - 22.0),
-                Align2::CENTER_BOTTOM,
-                hint,
-                FontId::proportional(11.0),
-                Color32::from_gray(110),
-            );
+        // Les commandes et l'indication « Page · Case », un instant après
+        // chaque mouvement, en fondu.
+        let shown = now < self.hud_until;
+        let opacity = ctx.animate_bool_with_time(ui.id().with("hud"), shown, 0.2);
+        if shown {
             ctx.request_repaint_after(Duration::from_secs_f64((self.hud_until - now).max(0.05)));
+        } else if is_fullscreen {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
         }
-
-        // Le retour à l'accueil, en haut à gauche, quand on bouge la souris.
-        if now < self.hud_until {
-            let button = Rect::from_min_size(area.min + vec2(14.0, 14.0), vec2(108.0, 30.0));
-            let back = ui.interact(button, ui.id().with("accueil"), Sense::click());
-            let fill = if back.hovered() { 235 } else { 190 };
-            painter.rect_filled(button, 15.0, Color32::from_black_alpha(fill));
-            // La flèche dessinée : la police n'a pas « ← ».
-            let tip = pos2(button.left() + 16.0, button.center().y);
-            let stroke = egui::Stroke::new(1.6, Color32::WHITE);
-            painter.line_segment([tip, tip + vec2(12.0, 0.0)], stroke);
-            painter.line_segment([tip, tip + vec2(5.0, -5.0)], stroke);
-            painter.line_segment([tip, tip + vec2(5.0, 5.0)], stroke);
-            painter.text(
-                pos2(button.left() + 38.0, button.center().y),
-                Align2::LEFT_CENTER,
-                "Accueil",
-                FontId::proportional(14.0),
-                Color32::WHITE,
-            );
-            if back.hovered() {
-                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        if opacity > 0.0 {
+            let book = self.book.as_ref().expect("album ouvert");
+            if let Some(count) = book.page_count {
+                let mut text = format!(
+                    "Page {} / {count}",
+                    book.position.rank(book.position.page) + 1
+                );
+                if !whole_page && let Some(n) = book.panel_count() {
+                    text += &format!("   ·   Case {} / {n}", book.position.panel.min(n - 1) + 1);
+                }
+                if let Some(progress) = book.progress(whole_page) {
+                    text += &format!("   ·   {}", percent(progress));
+                }
+                let mut painter = painter.clone();
+                painter.set_opacity(opacity);
+                let galley = painter.layout_no_wrap(text, FontId::proportional(14.0), TEXT);
+                let pill = Rect::from_center_size(
+                    pos2(area.center().x, area.bottom() - 40.0),
+                    galley.size() + vec2(32.0, 14.0),
+                );
+                painter.rect_filled(pill, pill.height() / 2.0, Color32::from_black_alpha(200));
+                painter.galley(pill.center() - galley.size() / 2.0, galley, TEXT);
+            }
+            let (bar, hovered) = self.toolbar(ui, area, opacity, is_fullscreen);
+            if hovered {
                 self.hud_until = self.hud_until.max(now + 1.0);
             }
-            close |= back.clicked();
+            actions.merge(bar);
         }
 
-        if close {
+        // La lecture automatique : un anneau qui se remplit jusqu'au pas suivant.
+        if let Some(part) = auto_part {
+            let center = pos2(area.right() - 34.0, area.bottom() - 40.0);
+            widgets::ring(&painter, center, 11.0, part, ACCENT);
+            widgets::icon(&painter, Icon::Pause, center, 11.0, TEXT);
+        }
+
+        self.apply(ctx, actions, now);
+    }
+
+    /// La barre d'outils en haut : retour à l'accueil, titre, modes de lecture,
+    /// lecture automatique, plein écran. Renvoie ce qui a été cliqué, et si la
+    /// souris est dessus.
+    fn toolbar(
+        &self,
+        ui: &mut egui::Ui,
+        area: Rect,
+        opacity: f32,
+        fullscreen: bool,
+    ) -> (Actions, bool) {
+        let book = self.book.as_ref().expect("album ouvert");
+        let mut a = Actions::default();
+        let mut painter = ui.painter_at(area);
+        painter.set_opacity(opacity);
+        let band = Rect::from_min_size(area.min, vec2(area.width(), 92.0));
+        widgets::shade(
+            &painter,
+            band,
+            Color32::from_black_alpha(190),
+            Color32::TRANSPARENT,
+        );
+        let inner = Rect::from_min_max(
+            area.min + vec2(14.0, 14.0),
+            pos2(area.right() - 14.0, area.top() + 48.0),
+        );
+        let compact = area.width() < 820.0;
+        let label = |full: &'static str| if compact { "" } else { full };
+        let tone = |on: bool| if on { Tone::Active } else { Tone::Plain };
+        let whole_page = self.state.whole_page;
+        let manga = book.position.manga;
+        let mut hovered = false;
+
+        let mut right_edge = inner.right();
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                ui.multiply_opacity(opacity);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let icon = if fullscreen {
+                    Icon::ExitFullscreen
+                } else {
+                    Icon::Fullscreen
+                };
+                a.fullscreen = widgets::button(ui, Some(icon), "", Tone::Plain)
+                    .on_hover_text("Plein écran (F)")
+                    .clicked();
+                ui.add_space(10.0);
+                a.toggle_manga = widgets::button(
+                    ui,
+                    Some(Icon::RightToLeft),
+                    label("Manga"),
+                    tone(manga),
+                )
+                .on_hover_text(
+                    "Manga : de la dernière page à la première, cases de droite à gauche (M)",
+                )
+                .clicked();
+                ui.add_space(10.0);
+                let page = widgets::button(ui, Some(Icon::Page), label("Page"), tone(whole_page))
+                    .on_hover_text("Page entière (P)");
+                let panels =
+                    widgets::button(ui, Some(Icon::Panels), label("Cases"), tone(!whole_page))
+                        .on_hover_text("Case par case (P)");
+                a.toggle_page = (page.clicked() && !whole_page) || (panels.clicked() && whole_page);
+                ui.add_space(10.0);
+                a.slower = widgets::button(ui, Some(Icon::Plus), "", Tone::Plain)
+                    .on_hover_text("Plus de temps par case (+)")
+                    .clicked();
+                let (icon, tip) = if self.auto_play {
+                    (Icon::Pause, "Arrêter la lecture automatique (A)")
+                } else {
+                    (Icon::Play, "Lecture automatique (A)")
+                };
+                a.toggle_auto = widgets::button(
+                    ui,
+                    Some(icon),
+                    &format!("{} s", self.state.auto_secs),
+                    tone(self.auto_play),
+                )
+                .on_hover_text(tip)
+                .clicked();
+                a.faster = widgets::button(ui, Some(Icon::Minus), "", Tone::Plain)
+                    .on_hover_text("Moins de temps par case (−)")
+                    .clicked();
+                right_edge = ui.min_rect().left();
+                hovered |= ui.rect_contains_pointer(ui.min_rect());
+            },
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.multiply_opacity(opacity);
+                a.close = widgets::button(ui, Some(Icon::Back), label("Accueil"), Tone::Plain)
+                    .on_hover_text("Revenir à la bibliothèque (Échap)")
+                    .clicked();
+                hovered |= ui.rect_contains_pointer(ui.min_rect());
+                let left = ui.min_rect().right() + 16.0;
+                let room = right_edge - left - 16.0;
+                if room > 60.0 {
+                    let mut job = egui::text::LayoutJob::simple(
+                        title(&book.path),
+                        FontId::proportional(14.0),
+                        Color32::from_gray(200),
+                        room,
+                    );
+                    job.wrap.max_rows = 1;
+                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                    painter.galley(
+                        pos2(left, inner.center().y - galley.size().y / 2.0),
+                        galley,
+                        TEXT,
+                    );
+                }
+            },
+        );
+        (a, hovered)
+    }
+
+    /// Fait avancer la lecture automatique. Renvoie la part écoulée avant le
+    /// pas suivant (de 0 à 1), si elle est en cours.
+    fn autoplay(&mut self, ctx: &egui::Context, now: f64) -> Option<f32> {
+        if !self.auto_play {
+            return None;
+        }
+        let book = self.book.as_ref()?;
+        // Le temps ne compte qu'une fois la case arrivée à l'écran.
+        let idle = book.error.is_none()
+            && book.camera_move.is_none()
+            && book.current().is_some()
+            && !book.to_last_panel;
+        if !idle {
+            return Some(0.0);
+        }
+        let since = *self.auto_since.get_or_insert(now);
+        let part = ((now - since) / self.state.auto_secs) as f32;
+        if part < 1.0 {
+            ctx.request_repaint_after(Duration::from_millis(33));
+            return Some(part);
+        }
+        let before = book.position;
+        let step = Actions {
+            next: true,
+            auto: true,
+            ..Actions::default()
+        };
+        self.apply(ctx, step, now);
+        self.auto_since = None;
+        let book = self.book.as_ref()?;
+        if book.position.page == before.page && book.position.panel == before.panel {
+            // Fin de l'album.
+            self.auto_play = false;
+            self.hud_until = now + HUD_SECS;
+            return None;
+        }
+        Some(0.0)
+    }
+
+    fn apply(&mut self, ctx: &egui::Context, a: Actions, now: f64) {
+        let whole_page = self.state.whole_page;
+        let Some(book) = self.book.as_mut() else {
+            return;
+        };
+        let before = book.position;
+        if a.next {
+            book.next(now, whole_page);
+        }
+        if a.previous {
+            book.previous(now, whole_page);
+        }
+        if a.first {
+            book.go_to_page(book.position.rank(0), whole_page);
+        }
+        if a.last
+            && let Some(count) = book.page_count
+        {
+            book.go_to_page(book.position.rank(count.saturating_sub(1)), whole_page);
+        }
+        if let Some(page) = a.jump {
+            book.go_to_page(page, whole_page);
+        }
+        if a.toggle_page {
+            self.state.whole_page = !whole_page;
+            if let Some(here) = book.camera(now, whole_page) {
+                book.glide(From::Rect(here), MOVE_SECS);
+            }
+        }
+        if a.toggle_manga {
+            book.set_manga(!book.position.manga, now, self.state.whole_page);
+        }
+        let moved = book.position.page != before.page || book.position.panel != before.panel;
+        if moved {
+            self.auto_since = None;
+        }
+        if a.toggle_auto {
+            self.auto_play = !self.auto_play;
+            self.auto_since = None;
+        }
+        if a.faster || a.slower {
+            let secs = self.state.auto_secs;
+            self.state.auto_secs = if a.slower {
+                AUTO_STEPS
+                    .iter()
+                    .copied()
+                    .find(|&s| s > secs)
+                    .unwrap_or(secs)
+            } else {
+                AUTO_STEPS
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&s| s < secs)
+                    .unwrap_or(secs)
+            };
+        }
+        let changed = moved || a.toggle_page || a.toggle_manga || a.faster || a.slower;
+        if changed {
+            self.state_dirty_since.get_or_insert(now);
+        }
+        if (changed || a.toggle_auto) && !a.auto {
+            self.hud_until = now + HUD_SECS;
+        }
+        if a.fullscreen {
+            let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+        }
+        if a.close {
             self.close(ctx);
         }
     }
+}
+
+impl Actions {
+    fn merge(&mut self, other: Actions) {
+        self.next |= other.next;
+        self.previous |= other.previous;
+        self.first |= other.first;
+        self.last |= other.last;
+        self.jump = self.jump.or(other.jump);
+        self.toggle_page |= other.toggle_page;
+        self.toggle_manga |= other.toggle_manga;
+        self.toggle_auto |= other.toggle_auto;
+        self.faster |= other.faster;
+        self.slower |= other.slower;
+        self.fullscreen |= other.fullscreen;
+        self.close |= other.close;
+    }
+}
+
+/// L'accueil sans aucun album.
+fn empty_library(ui: &mut egui::Ui) {
+    ui.add_space(90.0);
+    ui.vertical_centered(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
+        ui.painter().circle_filled(r.center(), 36.0, SURFACE);
+        widgets::icon(ui.painter(), Icon::Folder, r.center(), 30.0, MUTED);
+        ui.add_space(18.0);
+        ui.label(
+            egui::RichText::new("Ta bibliothèque est vide")
+                .size(20.0)
+                .strong()
+                .color(TEXT),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Ouvre un PDF, glisse-le dans la fenêtre, ou ajoute le dossier où sont tes BD.",
+            )
+            .color(MUTED),
+        );
+    });
+}
+
+/// Le nom de l'album : celui du fichier, sans extension.
+fn title(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Album".into())
 }
 
 fn percent(progress: f32) -> String {

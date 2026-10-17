@@ -15,6 +15,9 @@ l'installe depuis sa page Téléchargements. Il marche aussi tout seul.
 | ← ↑, clic dans le tiers gauche | case précédente |
 | Barre du bas | aller à une page |
 | P | page entière |
+| A | lecture automatique (5 s par case par défaut) |
+| − / + | moins / plus de temps par case en lecture automatique |
+| M | manga : de la dernière page à la première, cases de droite à gauche |
 | F | plein écran |
 | ⌘ O | ouvrir un PDF |
 | Échap, ⌘ W | revenir à la bibliothèque |

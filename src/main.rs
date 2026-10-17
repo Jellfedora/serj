@@ -5,6 +5,7 @@ mod library;
 mod loader;
 mod shots;
 mod state;
+mod widgets;
 
 /// Linux : relie la fenêtre à son icône (Wayland et X11).
 const APP_ID: &str = "serj";

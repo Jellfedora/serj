@@ -17,6 +17,9 @@ enum Request {
     Want(Vec<usize>),
     /// Page oubliée par l'appli : à rendre de nouveau si on la redemande.
     Forget(usize),
+    /// Sens de lecture des cases : de droite à gauche pour un manga. Les pages
+    /// déjà rendues le sont de nouveau, dans le nouvel ordre.
+    RightToLeft(bool),
 }
 
 pub enum Event {
@@ -38,12 +41,12 @@ pub struct Loader {
 }
 
 impl Loader {
-    pub fn open(path: PathBuf, repaint: egui::Context) -> Self {
+    pub fn open(path: PathBuf, right_to_left: bool, repaint: egui::Context) -> Self {
         let (requests, inbox) = channel();
         let (outbox, events) = channel();
         std::thread::Builder::new()
             .name("serj-loader".into())
-            .spawn(move || run(path, inbox, outbox, repaint))
+            .spawn(move || run(path, right_to_left, inbox, outbox, repaint))
             .expect("thread du chargeur");
         Self { requests, events }
     }
@@ -55,9 +58,19 @@ impl Loader {
     pub fn forget(&self, page: usize) {
         let _ = self.requests.send(Request::Forget(page));
     }
+
+    pub fn right_to_left(&self, rtl: bool) {
+        let _ = self.requests.send(Request::RightToLeft(rtl));
+    }
 }
 
-fn run(path: PathBuf, inbox: Receiver<Request>, outbox: Sender<Event>, repaint: egui::Context) {
+fn run(
+    path: PathBuf,
+    mut rtl: bool,
+    inbox: Receiver<Request>,
+    outbox: Sender<Event>,
+    repaint: egui::Context,
+) {
     let send = |event| {
         let _ = outbox.send(event);
         repaint.request_repaint();
@@ -74,23 +87,29 @@ fn run(path: PathBuf, inbox: Receiver<Request>, outbox: Sender<Event>, repaint: 
 
     let mut wanted: Vec<usize> = Vec::new();
     let mut sent: HashSet<usize> = HashSet::new();
-    let apply = |r: Request, wanted: &mut Vec<usize>, sent: &mut HashSet<usize>| match r {
-        Request::Want(pages) => *wanted = pages,
-        Request::Forget(page) => {
-            sent.remove(&page);
-        }
-    };
+    let apply =
+        |r: Request, wanted: &mut Vec<usize>, sent: &mut HashSet<usize>, rtl: &mut bool| match r {
+            Request::Want(pages) => *wanted = pages,
+            Request::Forget(page) => {
+                sent.remove(&page);
+            }
+            Request::RightToLeft(on) if on != *rtl => {
+                *rtl = on;
+                sent.clear();
+            }
+            Request::RightToLeft(_) => {}
+        };
     loop {
         // On n'attend que s'il n'y a rien à rendre ; les nouvelles demandes
         // remplacent toujours les anciennes.
         if wanted.iter().all(|p| sent.contains(p) || *p >= count) {
             match inbox.recv() {
-                Ok(r) => apply(r, &mut wanted, &mut sent),
+                Ok(r) => apply(r, &mut wanted, &mut sent, &mut rtl),
                 Err(_) => return,
             }
         }
         while let Ok(r) = inbox.try_recv() {
-            apply(r, &mut wanted, &mut sent);
+            apply(r, &mut wanted, &mut sent, &mut rtl);
         }
         let Some(&index) = wanted.iter().find(|p| !sent.contains(p) && **p < count) else {
             continue;
@@ -99,7 +118,7 @@ fn run(path: PathBuf, inbox: Receiver<Request>, outbox: Sender<Event>, repaint: 
         let Some(image) = doc.render(index, RENDER_HEIGHT) else {
             continue;
         };
-        let mut found = panels::detect(image.width, image.height, &image.rgba, false);
+        let mut found = panels::detect(image.width, image.height, &image.rgba, rtl);
         if found.is_empty() {
             // Page blanche ou presque : on la montre entière.
             found.push(Rect {
