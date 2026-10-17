@@ -18,6 +18,8 @@ l'installe depuis sa page Téléchargements. Il marche aussi tout seul.
 | A | lecture automatique (5 s par case par défaut) |
 | − / + | moins / plus de temps par case en lecture automatique |
 | M | manga : de la dernière page à la première, cases de droite à gauche |
+| Pincement, ⌘ molette, ⌘ + / ⌘ − | zoomer (vers le pointeur) ; glisser ou molette pour se déplacer |
+| Z, ⌘ 0 | zoomer ×2,5 / revenir à la page entière (Échap aussi) |
 | F | plein écran |
 | ⌘ O | ouvrir un PDF |
 | Échap, ⌘ W | revenir à la bibliothèque |

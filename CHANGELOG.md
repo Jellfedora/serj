@@ -1,5 +1,9 @@
 # Changelog
 
+## [Non publié]
+
+- Zoom (page entière comme case par case) : pincement du trackpad, ⌘ molette, ⌘ + / ⌘ −, ou Z ; la vue se déplace en glissant ou à la molette ; ⌘ 0, Z ou Échap pour revenir. Le zoom revient à 100 % en changeant de case, et la lecture automatique attend pendant qu'on est zoomé.
+
 ## [0.2.1]
 
 - Les boutons de la barre de lecture se lisent sur les planches claires : fond sombre, liseré, dégradé plus marqué.

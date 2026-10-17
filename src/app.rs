@@ -24,6 +24,9 @@ const SCREEN_MARGIN: f32 = 20.0;
 const KEEP_AROUND: usize = 2;
 /// Combien de temps les commandes et l'indication « Page · Case » restent visibles.
 const HUD_SECS: f64 = 2.2;
+/// Zoom maximal, et celui de la touche Z.
+const MAX_ZOOM: f32 = 6.0;
+const KEY_ZOOM: f32 = 2.5;
 /// Délais proposés pour la lecture automatique, en secondes.
 const AUTO_STEPS: [f64; 12] = [
     2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0,
@@ -114,6 +117,10 @@ pub struct App {
     /// Lecture automatique en cours, et depuis quand la case est à l'écran.
     auto_play: bool,
     auto_since: Option<f64>,
+    /// Zoom (1 : la case ou la page tient dans l'écran) et décalage du centre
+    /// de la vue, en pixels de la page. Remis à zéro à chaque mouvement.
+    zoom: f32,
+    pan: Vec2,
     library: library::Library,
     /// Les albums de l'accueil, et quand ils ont été cherchés.
     books: Vec<PathBuf>,
@@ -134,6 +141,8 @@ impl App {
             auto_next: false,
             auto_play: false,
             auto_since: None,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
             library: library::Library::new(cc.egui_ctx.clone()),
             books: Vec::new(),
             books_at: None,
@@ -821,7 +830,23 @@ impl App {
 
         // Clavier, souris, molette.
         let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let zoomed = self.zoom > 1.0;
+        let mut key_zoom = None;
         let mut input = ctx.input_mut(|i| {
+            // Zoom : ⌘ + / ⌘ − / ⌘ 0, et Z pour zoomer ou revenir.
+            let cmd = egui::Modifiers::COMMAND;
+            if i.consume_key(cmd, Key::Plus) | i.consume_key(cmd, Key::Equals) {
+                key_zoom = Some(1.5);
+            }
+            if i.consume_key(cmd, Key::Minus) {
+                key_zoom = Some(1.0 / 1.5);
+            }
+            if i.consume_key(cmd, Key::Num0) {
+                key_zoom = Some(0.0);
+            }
+            if i.consume_key(egui::Modifiers::NONE, Key::Z) {
+                key_zoom = Some(if zoomed { 0.0 } else { KEY_ZOOM });
+            }
             let shift_space = i.consume_key(egui::Modifiers::SHIFT, Key::Space);
             let mut any = |keys: &[Key]| {
                 keys.iter().fold(false, |hit, k| {
@@ -829,6 +854,11 @@ impl App {
                 })
             };
             let escape = any(&[Key::Escape]);
+            // Échap dézoome d'abord.
+            if escape && zoomed {
+                key_zoom = Some(0.0);
+            }
+            let escape = escape && !zoomed;
             Actions {
                 next: any(&[
                     Key::ArrowRight,
@@ -853,9 +883,11 @@ impl App {
                 ..Actions::default()
             }
         });
-        // Clic à droite pour avancer, à gauche pour reculer.
-        let response = ui.interact(area, ui.id().with("lecture"), Sense::click());
+        // Clic à droite pour avancer, à gauche pour reculer ; une fois zoomé,
+        // on fait glisser la planche (à la souris ou à la molette).
+        let response = ui.interact(area, ui.id().with("lecture"), Sense::click_and_drag());
         if response.clicked()
+            && !zoomed
             && let Some(p) = response.interact_pointer_pos()
         {
             if p.x > area.left() + area.width() / 3.0 {
@@ -864,7 +896,11 @@ impl App {
                 input.previous = true;
             }
         }
-        let wheel = ctx.input(|i| i.smooth_scroll_delta.y);
+        let wheel = if zoomed {
+            0.0
+        } else {
+            ctx.input(|i| i.smooth_scroll_delta.y)
+        };
         self.scroll += wheel;
         if self.scroll.abs() > 90.0 {
             if self.scroll < 0.0 {
@@ -910,8 +946,62 @@ impl App {
             let page = book.current().expect("page rendue");
             // La caméra remplit l'écran (moins une marge), centrée.
             let room = area.shrink(SCREEN_MARGIN);
-            let scale = (room.width() / camera.width()).min(room.height() / camera.height());
-            let to_screen = |p: Pos2| area.center() + (p - camera.center()) * scale;
+            let fit = (room.width() / camera.width()).min(room.height() / camera.height());
+
+            // Le zoom : pincement, ⌘ molette ou clavier, vers le pointeur ;
+            // puis on fait glisser la vue.
+            let (pinch, pointer, scroll) =
+                ctx.input(|i| (i.zoom_delta(), i.pointer.hover_pos(), i.smooth_scroll_delta));
+            let factor = match key_zoom {
+                Some(0.0) => 1.0 / self.zoom,
+                Some(f) => f,
+                None => pinch,
+            };
+            if factor != 1.0 {
+                let anchor = match key_zoom {
+                    Some(_) => area.center(),
+                    None => pointer
+                        .filter(|p| area.contains(*p))
+                        .unwrap_or(area.center()),
+                };
+                let old = fit * self.zoom;
+                self.zoom = (self.zoom * factor).clamp(1.0, MAX_ZOOM);
+                let new = fit * self.zoom;
+                // Le point de la page sous `anchor` y reste.
+                let under = camera.center() + self.pan + (anchor - area.center()) / old;
+                self.pan = under - (anchor - area.center()) / new - camera.center();
+                self.hud_until = now + HUD_SECS;
+            }
+            if self.zoom > 1.0 {
+                let scale = fit * self.zoom;
+                self.pan -= (response.drag_delta() + scroll) / scale;
+                if response.dragged() {
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                } else if response.hovered() {
+                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                // La vue reste sur la planche.
+                let half = area.size() / scale / 2.0;
+                let center = camera.center() + self.pan;
+                let clamp = |c: f32, half: f32, size: f32| {
+                    if 2.0 * half >= size {
+                        size / 2.0
+                    } else {
+                        c.clamp(half, size - half)
+                    }
+                };
+                let clamped = pos2(
+                    clamp(center.x, half.x, page.size.x),
+                    clamp(center.y, half.y, page.size.y),
+                );
+                self.pan = clamped - camera.center();
+            } else {
+                self.zoom = 1.0;
+                self.pan = Vec2::ZERO;
+            }
+            let scale = fit * self.zoom;
+            let center = camera.center() + self.pan;
+            let to_screen = |p: Pos2| area.center() + (p - center) * scale;
             let page_rect =
                 Rect::from_min_max(to_screen(Pos2::ZERO), to_screen(page.size.to_pos2()));
             let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
@@ -1019,6 +1109,9 @@ impl App {
                 }
                 if let Some(progress) = book.progress(whole_page) {
                     text += &format!("   ·   {}", percent(progress));
+                }
+                if self.zoom > 1.0 {
+                    text += &format!("   ·   Zoom {} %", (self.zoom * 100.0).round() as u32);
                 }
                 let mut painter = painter.clone();
                 painter.set_opacity(opacity);
@@ -1177,7 +1270,9 @@ impl App {
         }
         let book = self.book.as_ref()?;
         // Le temps ne compte qu'une fois la case arrivée à l'écran.
-        let idle = book.error.is_none()
+        // Pas de pas automatique pendant qu'on regarde un détail de près.
+        let idle = self.zoom <= 1.0
+            && book.error.is_none()
             && book.camera_move.is_none()
             && book.current().is_some()
             && !book.to_last_panel;
@@ -1264,6 +1359,10 @@ impl App {
                     .find(|&s| s < secs)
                     .unwrap_or(secs)
             };
+        }
+        if moved || a.toggle_page || a.toggle_manga {
+            self.zoom = 1.0;
+            self.pan = Vec2::ZERO;
         }
         let changed = moved || a.toggle_page || a.toggle_manga || a.faster || a.slower;
         if changed {
