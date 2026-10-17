@@ -10,6 +10,7 @@ use egui::{
     vec2,
 };
 
+use crate::library;
 use crate::loader::{Event, LoadedPage, Loader};
 use crate::state::{Position, State};
 
@@ -78,6 +79,10 @@ pub struct App {
     state_dirty_since: Option<f64>,
     shots: Option<crate::shots::Shots>,
     auto_next: bool,
+    library: library::Library,
+    /// Les albums de l'accueil, et quand ils ont été cherchés.
+    books: Vec<PathBuf>,
+    books_at: Option<f64>,
 }
 
 impl App {
@@ -95,6 +100,9 @@ impl App {
             state_dirty_since: None,
             shots: crate::shots::Shots::from_env(),
             auto_next: false,
+            library: library::Library::new(cc.egui_ctx.clone()),
+            books: Vec::new(),
+            books_at: None,
         };
         // Le fichier passé en argument, sinon le dernier album lu (sauf pour
         // tester l'accueil avec SERJ_ACCUEIL).
@@ -414,7 +422,7 @@ impl eframe::App for App {
         if self.book.is_some() {
             self.reading(ui, &ctx, area, now);
         } else {
-            self.welcome(ui, &ctx, area);
+            self.welcome(ui, &ctx, area, now);
         }
 
         if let Some(shots) = &mut self.shots {
@@ -441,90 +449,254 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn welcome(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect) {
-        let width = 420.0_f32.min(area.width() - 32.0);
-        let column = Rect::from_center_size(area.center(), vec2(width, area.height() - 64.0));
-        let mut open = None;
+    fn welcome(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, now: f64) {
+        self.library.receive(ctx);
+        // Les dossiers relus de temps en temps : un album ajouté y apparaît seul.
+        if self.books_at.is_none_or(|at| now - at > 5.0) {
+            self.books = library::books(&self.state.recents, &self.state.folders);
+            self.books_at = Some(now);
+        }
+        let pad = if area.width() > 700.0 { 40.0 } else { 16.0 };
+        let column = Rect::from_min_max(area.min + vec2(pad, 0.0), area.max - vec2(pad, 0.0));
+        let (mut open, mut pick, mut add_folder) = (None, false, false);
+        let (mut remove_folder, mut forget, mut restart) = (None, None, None);
         ui.scope_builder(egui::UiBuilder::new().max_rect(column), |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space((column.height() * 0.18).max(8.0));
-                ui.label(
-                    egui::RichText::new("Serj")
-                        .size(56.0)
-                        .strong()
-                        .color(ACCENT),
-                );
-                ui.label(
-                    egui::RichText::new("Lecteur de BD, case par case")
-                        .size(16.0)
-                        .color(MUTED),
-                );
-                ui.add_space(28.0);
-                let button =
-                    egui::Button::new(egui::RichText::new("Ouvrir un PDF…   ⌘ O").size(16.0))
-                        .min_size(vec2(220.0, 40.0));
-                if ui.add(button).clicked() {
-                    self.pick_file(ctx);
-                }
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("ou glisse un PDF dans la fenêtre").color(MUTED));
-
-                let recents: Vec<PathBuf> = self
-                    .state
-                    .recents
-                    .iter()
-                    .filter(|p| p.exists())
-                    .cloned()
-                    .collect();
-                if !recents.is_empty() {
-                    ui.add_space(36.0);
-                    ui.label(egui::RichText::new("Récents").size(13.0).color(MUTED));
-                    ui.add_space(6.0);
-                    for path in recents {
-                        let name = path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let pos = self.state.position(&path);
-                        let where_ = if pos.pages == 0 {
-                            format!("page {}", pos.page + 1)
-                        } else if pos.progress >= 0.999 {
-                            "terminé".to_string()
-                        } else {
-                            format!(
-                                "page {} / {}   ·   {}",
-                                pos.page + 1,
-                                pos.pages,
-                                percent(pos.progress)
-                            )
-                        };
-                        let text = format!("{}   ·   {where_}", shorten(&name, 40));
-                        let row = ui
-                            .add(egui::Button::new(text).frame(false))
-                            .on_hover_text(path.display().to_string());
-                        if pos.pages > 0 {
-                            // Petite barre d'avancement sous le titre.
-                            let track = Rect::from_center_size(
-                                pos2(row.rect.center().x, row.rect.bottom() + 1.0),
-                                vec2(row.rect.width().min(260.0), 2.0),
-                            );
-                            let mut done = track;
-                            done.max.x =
-                                track.left() + track.width() * pos.progress.clamp(0.0, 1.0);
-                            ui.painter().rect_filled(track, 1.0, Color32::from_gray(50));
-                            ui.painter().rect_filled(done, 1.0, ACCENT);
-                            ui.add_space(6.0);
-                        }
-                        if row.clicked() {
-                            open = Some(path);
-                        }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_space(26.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Serj").size(34.0).strong().color(ACCENT));
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Lecteur de BD, case par case")
+                                .size(14.0)
+                                .color(MUTED),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let button = |text: &str| {
+                                egui::Button::new(egui::RichText::new(text).size(14.0))
+                                    .min_size(vec2(0.0, 32.0))
+                                    .corner_radius(8.0)
+                            };
+                            add_folder |= ui.add(button("Ajouter un dossier…")).clicked();
+                            pick |= ui.add(button("Ouvrir un PDF…   ⌘ O")).clicked();
+                        });
+                    });
+                    if !self.state.folders.is_empty() {
+                        ui.add_space(10.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("Dossiers").size(12.0).color(MUTED));
+                            for folder in &self.state.folders {
+                                let name = folder
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| folder.display().to_string());
+                                ui.label(egui::RichText::new(name).size(12.0))
+                                    .on_hover_text(folder.display().to_string());
+                                if ui
+                                    .add(egui::Button::new(egui::RichText::new("×").size(13.0)).frame(false))
+                                    .on_hover_text("Retirer ce dossier de la bibliothèque")
+                                    .clicked()
+                                {
+                                    remove_folder = Some(folder.clone());
+                                }
+                                ui.add_space(8.0);
+                            }
+                        });
                     }
-                }
-            });
+                    ui.add_space(24.0);
+
+                    if self.books.is_empty() {
+                        ui.add_space(60.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(egui::RichText::new("Ta bibliothèque est vide").size(20.0));
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Ouvre un PDF, glisse-le dans la fenêtre, ou ajoute le dossier où sont tes BD.",
+                                )
+                                .color(MUTED),
+                            );
+                        });
+                        return;
+                    }
+
+                    // La grille des albums, centrée.
+                    let (card_w, gap) = (156.0_f32, 26.0_f32);
+                    let width = ui.available_width();
+                    let cols = (((width + gap) / (card_w + gap)).floor() as usize).max(1);
+                    let used = cols as f32 * card_w + (cols - 1) as f32 * gap;
+                    let indent = ((width - used) / 2.0).max(0.0);
+                    for row in self.books.clone().chunks(cols) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(indent);
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for path in row {
+                                let card = self.book_card(ui, path, card_w);
+                                if card.clicked() {
+                                    open = Some(path.clone());
+                                }
+                                let recent = self.state.recents.contains(path);
+                                let started = self.state.position(path).pages > 0;
+                                card.context_menu(|ui| {
+                                    if started && ui.button("Recommencer au début").clicked() {
+                                        restart = Some(path.clone());
+                                    }
+                                    if recent && ui.button("Retirer des récents").clicked() {
+                                        forget = Some(path.clone());
+                                    }
+                                    if !recent && !started {
+                                        ui.label(egui::RichText::new("Clic pour lire").color(MUTED));
+                                    }
+                                });
+                            }
+                        });
+                        ui.add_space(22.0);
+                    }
+                });
         });
+        if pick {
+            self.pick_file(ctx);
+        }
+        if add_folder && let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            if !self.state.folders.contains(&folder) {
+                self.state.folders.push(folder);
+            }
+            self.state.save();
+            self.books_at = None;
+        }
+        if let Some(folder) = remove_folder {
+            self.state.folders.retain(|f| *f != folder);
+            self.state.save();
+            self.books_at = None;
+        }
+        if let Some(path) = forget {
+            self.state.recents.retain(|p| *p != path);
+            self.state.save();
+            self.books_at = None;
+        }
+        if let Some(path) = restart {
+            self.state.set_position(&path, Position::default());
+            self.state.save();
+        }
         if let Some(path) = open {
             self.open(ctx, path);
         }
+    }
+
+    /// Une carte de la bibliothèque : la couverture, le titre, où on en est.
+    fn book_card(&mut self, ui: &mut egui::Ui, path: &Path, width: f32) -> egui::Response {
+        let cover_h = width * 1.4;
+        let (rect, response) = ui.allocate_exact_size(vec2(width, cover_h + 62.0), Sense::click());
+        let hovered = response.hovered();
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let painter = ui.painter_at(rect.expand(6.0));
+        let lift = if hovered { -4.0 } else { 0.0 };
+        let slot = Rect::from_min_size(rect.min + vec2(0.0, lift), vec2(width, cover_h));
+        let cover_rect = match self.library.cover(path) {
+            library::Cover::Ready(texture) => {
+                // La couverture entière, posée en bas de sa place.
+                let size = texture.size_vec2();
+                let scale = (slot.width() / size.x).min(slot.height() / size.y);
+                let fitted = size * scale;
+                let r = Rect::from_min_size(
+                    pos2(slot.center().x - fitted.x / 2.0, slot.bottom() - fitted.y),
+                    fitted,
+                );
+                painter.rect_filled(
+                    r.translate(vec2(0.0, 6.0)).expand(2.0),
+                    8.0,
+                    Color32::from_black_alpha(90),
+                );
+                egui::Image::from_texture((texture.id(), size))
+                    .corner_radius(6.0)
+                    .paint_at(ui, r);
+                r
+            }
+            cover => {
+                let failed = matches!(cover, library::Cover::Failed);
+                painter.rect_filled(slot, 6.0, Color32::from_gray(38));
+                let text = if failed { "PDF illisible" } else { "…" };
+                painter.text(
+                    slot.center(),
+                    Align2::CENTER_CENTER,
+                    text,
+                    FontId::proportional(14.0),
+                    MUTED,
+                );
+                slot
+            }
+        };
+        if hovered {
+            painter.rect_stroke(
+                cover_rect,
+                6.0,
+                egui::Stroke::new(2.0, ACCENT),
+                egui::StrokeKind::Outside,
+            );
+        }
+
+        // Où on en est : une barre sous la couverture.
+        let pos = self.state.position(path);
+        let started = pos.pages > 0;
+        if started {
+            let track =
+                Rect::from_min_size(pos2(rect.left(), slot.bottom() + 8.0), vec2(width, 3.0));
+            let mut done = track;
+            done.max.x = track.left() + track.width() * pos.progress.clamp(0.0, 1.0);
+            painter.rect_filled(track, 1.5, Color32::from_gray(50));
+            painter.rect_filled(done, 1.5, ACCENT);
+        }
+
+        // Le titre, sur deux lignes au plus.
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut job = egui::text::LayoutJob::simple(
+            name,
+            FontId::proportional(13.0),
+            if hovered {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(215)
+            },
+            width,
+        );
+        job.wrap.max_rows = 2;
+        let title = ui.fonts_mut(|f| f.layout_job(job));
+        let title_h = title.size().y;
+        painter.galley(
+            pos2(rect.left(), slot.bottom() + 16.0),
+            title,
+            Color32::WHITE,
+        );
+        let (status, color) = if !started {
+            ("Nouveau".to_string(), ACCENT)
+        } else if pos.progress >= 0.999 {
+            ("Terminé".to_string(), MUTED)
+        } else {
+            (
+                format!(
+                    "{}   ·   page {} / {}",
+                    percent(pos.progress),
+                    pos.page + 1,
+                    pos.pages
+                ),
+                MUTED,
+            )
+        };
+        painter.text(
+            pos2(rect.left(), slot.bottom() + 20.0 + title_h),
+            Align2::LEFT_TOP,
+            status,
+            FontId::proportional(11.5),
+            color,
+        );
+        response.on_hover_text(path.display().to_string())
     }
 
     fn reading(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, now: f64) {
@@ -791,14 +963,6 @@ fn percent(progress: f32) -> String {
     format!("{} %", (progress * 100.0).floor() as u32)
 }
 
-fn shorten(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max - 1).collect::<String>() + "…"
-    }
-}
-
-fn is_pdf(p: &Path) -> bool {
+pub fn is_pdf(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
 }

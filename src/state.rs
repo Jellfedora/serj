@@ -24,6 +24,8 @@ pub struct State {
     pub positions: BTreeMap<String, Position>,
     /// Lecture page entière plutôt que case par case.
     pub whole_page: bool,
+    /// Dossiers dont les PDF sont montrés dans la bibliothèque de l'accueil.
+    pub folders: Vec<PathBuf>,
 }
 
 const MAX_RECENTS: usize = 12;

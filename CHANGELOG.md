@@ -9,4 +9,6 @@ Première version de Serj, le lecteur de BD qui lit case par case.
 - Les couvertures, pages de titre et galeries de personnages sans cases s'affichent entières.
 - Mode page entière (P), plein écran (F).
 - Barre d'avancement en bas : un clic ou un glissement pour aller à une page ; pourcentage lu.
-- Retient où tu t'es arrêté dans chaque album ; l'accueil liste les albums récents avec leur progression.
+- Retient où tu t'es arrêté dans chaque album.
+- L'accueil est une bibliothèque : les albums ouverts et ceux des dossiers ajoutés (« Ajouter un dossier… », sous-dossiers compris), avec leur couverture, leur titre et où tu en es (Nouveau, pourcentage, Terminé). Clic droit : recommencer au début, retirer des récents.
+- Bouton « Accueil » en haut à gauche pendant la lecture, et Échap pour revenir à la bibliothèque.

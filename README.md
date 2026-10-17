@@ -17,7 +17,7 @@ l'installe depuis sa page Téléchargements. Il marche aussi tout seul.
 | P | page entière |
 | F | plein écran |
 | ⌘ O | ouvrir un PDF |
-| ⌘ W | fermer l'album |
+| Échap, ⌘ W | revenir à la bibliothèque |
 
 ## Développement
 
