@@ -96,8 +96,16 @@ impl App {
             shots: crate::shots::Shots::from_env(),
             auto_next: false,
         };
-        // Le fichier passé en argument, sinon le dernier album lu.
-        let path = open.or_else(|| app.state.recents.first().filter(|p| p.exists()).cloned());
+        // Le fichier passé en argument, sinon le dernier album lu (sauf pour
+        // tester l'accueil avec SERJ_ACCUEIL).
+        let reopen = std::env::var_os("SERJ_ACCUEIL").is_none();
+        let path = open.or_else(|| {
+            app.state
+                .recents
+                .first()
+                .filter(|p| reopen && p.exists())
+                .cloned()
+        });
         if let Some(path) = path {
             app.open(&cc.egui_ctx, path);
         }
@@ -162,8 +170,10 @@ impl Book {
             match event {
                 Event::Opened { pages } => {
                     self.page_count = Some(pages);
+                    self.position.pages = pages;
                     if self.position.page >= pages {
-                        self.position = Position::default();
+                        self.position.page = 0;
+                        self.position.panel = 0;
                     }
                 }
                 Event::Failed(e) => self.error = Some(e),
@@ -206,6 +216,18 @@ impl Book {
 
     fn panel_count(&self) -> Option<usize> {
         self.current().map(|p| p.panels.len())
+    }
+
+    /// Part de l'album lue, de 0 à 1 : les pages finies, plus la part des
+    /// cases lues dans la page en cours.
+    fn progress(&self, whole_page: bool) -> Option<f32> {
+        let count = self.page_count.filter(|&c| c > 0)? as f32;
+        let page = self.position.page as f32;
+        let in_page = match self.panel_count() {
+            Some(n) if !whole_page => (self.position.panel.min(n - 1) + 1) as f32 / n as f32,
+            _ => 1.0,
+        };
+        Some(((page + in_page) / count).clamp(0.0, 1.0))
     }
 
     /// Où la caméra doit aller : la case lue, ou la planche entière.
@@ -259,6 +281,7 @@ impl Book {
             self.position = Position {
                 page: self.position.page + 1,
                 panel: 0,
+                ..self.position
             };
             self.to_last_panel = false;
             self.camera_move = if whole_page {
@@ -284,6 +307,7 @@ impl Book {
             self.position = Position {
                 page: self.position.page - 1,
                 panel: 0,
+                ..self.position
             };
             self.to_last_panel = !whole_page;
             self.camera_move = if whole_page {
@@ -303,6 +327,7 @@ impl Book {
         self.position = Position {
             page: page.min(count.saturating_sub(1)),
             panel: 0,
+            ..self.position
         };
         self.to_last_panel = false;
         self.camera_move = if whole_page {
@@ -396,7 +421,7 @@ impl eframe::App for App {
             let idle = self
                 .book
                 .as_ref()
-                .is_some_and(|b| b.camera_move.is_none() && b.current().is_some());
+                .is_none_or(|b| b.camera_move.is_none() && b.current().is_some());
             self.auto_next = shots.frame(&ctx, now, idle);
         }
 
@@ -461,12 +486,36 @@ impl App {
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default();
                         let pos = self.state.position(&path);
-                        let text = format!("{}   ·   page {}", shorten(&name, 48), pos.page + 1);
-                        if ui
+                        let where_ = if pos.pages == 0 {
+                            format!("page {}", pos.page + 1)
+                        } else if pos.progress >= 0.999 {
+                            "terminé".to_string()
+                        } else {
+                            format!(
+                                "page {} / {}   ·   {}",
+                                pos.page + 1,
+                                pos.pages,
+                                percent(pos.progress)
+                            )
+                        };
+                        let text = format!("{}   ·   {where_}", shorten(&name, 40));
+                        let row = ui
                             .add(egui::Button::new(text).frame(false))
-                            .on_hover_text(path.display().to_string())
-                            .clicked()
-                        {
+                            .on_hover_text(path.display().to_string());
+                        if pos.pages > 0 {
+                            // Petite barre d'avancement sous le titre.
+                            let track = Rect::from_center_size(
+                                pos2(row.rect.center().x, row.rect.bottom() + 1.0),
+                                vec2(row.rect.width().min(260.0), 2.0),
+                            );
+                            let mut done = track;
+                            done.max.x =
+                                track.left() + track.width() * pos.progress.clamp(0.0, 1.0);
+                            ui.painter().rect_filled(track, 1.0, Color32::from_gray(50));
+                            ui.painter().rect_filled(done, 1.0, ACCENT);
+                            ui.add_space(6.0);
+                        }
+                        if row.clicked() {
                             open = Some(path);
                         }
                     }
@@ -624,6 +673,56 @@ impl App {
             );
         }
 
+        if let Some(progress) = book.progress(whole_page) {
+            book.position.progress = progress;
+        }
+
+        // La barre d'avancement, tout en bas : on y clique ou on la fait
+        // glisser pour sauter à une page.
+        let mut jump = None;
+        if let (Some(count), Some(progress)) = (book.page_count, book.progress(whole_page)) {
+            let zone = Rect::from_min_max(pos2(area.left(), area.bottom() - 18.0), area.max);
+            let bar = ui.interact(zone, ui.id().with("avancement"), Sense::click_and_drag());
+            let active = bar.hovered() || bar.dragged();
+            let height = if active { 8.0 } else { 3.0 };
+            let track = Rect::from_min_max(pos2(area.left(), area.bottom() - height), area.max);
+            painter.rect_filled(track, 0.0, Color32::from_gray(if active { 60 } else { 42 }));
+            let mut done = track;
+            done.max.x = track.left() + track.width() * progress;
+            painter.rect_filled(done, 0.0, ACCENT);
+            if active {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                self.hud_until = self.hud_until.max(now + 1.0);
+            }
+            let page_at = |x: f32| {
+                let t = ((x - track.left()) / track.width()).clamp(0.0, 0.9999);
+                (t * count as f32) as usize
+            };
+            if let Some(p) = bar.hover_pos().or(bar.interact_pointer_pos()) {
+                let target = page_at(p.x);
+                let label = painter.layout_no_wrap(
+                    format!("Page {}", target + 1),
+                    FontId::proportional(13.0),
+                    Color32::WHITE,
+                );
+                let x = p.x.clamp(area.left() + 40.0, area.right() - 40.0);
+                let tip = Rect::from_center_size(
+                    pos2(x, track.top() - 20.0),
+                    label.size() + vec2(16.0, 8.0),
+                );
+                painter.rect_filled(tip, 6.0, Color32::from_black_alpha(220));
+                painter.galley(tip.center() - label.size() / 2.0, label, Color32::WHITE);
+                if (bar.clicked() || bar.dragged()) && target != book.position.page {
+                    jump = Some(target);
+                }
+            }
+        }
+        if let Some(page) = jump {
+            book.go_to_page(page, whole_page);
+            self.hud_until = now + HUD_SECS;
+            self.state_dirty_since.get_or_insert(now);
+        }
+
         // Où on en est, un instant après chaque mouvement.
         if now < self.hud_until
             && let Some(count) = book.page_count
@@ -632,17 +731,20 @@ impl App {
             if !whole_page && let Some(n) = book.panel_count() {
                 text += &format!("   ·   Case {} / {n}", book.position.panel.min(n - 1) + 1);
             }
+            if let Some(progress) = book.progress(whole_page) {
+                text += &format!("   ·   {}", percent(progress));
+            }
             let galley =
                 painter.layout_no_wrap(text, FontId::proportional(14.0), Color32::from_gray(225));
             let pill = Rect::from_center_size(
-                pos2(area.center().x, area.bottom() - 40.0),
+                pos2(area.center().x, area.bottom() - 52.0),
                 galley.size() + vec2(28.0, 12.0),
             );
             painter.rect_filled(pill, 14.0, Color32::from_black_alpha(200));
             painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
-            let hint = "Flèches ou clic  case suivante    P  page entière    F  plein écran    ⌘ W  fermer";
+            let hint = "Flèches ou clic  case suivante    Barre du bas  aller à une page    P  page entière    F  plein écran    ⌘ W  fermer";
             painter.text(
-                pos2(area.center().x, area.bottom() - 8.0),
+                pos2(area.center().x, area.bottom() - 22.0),
                 Align2::CENTER_BOTTOM,
                 hint,
                 FontId::proportional(11.0),
@@ -655,6 +757,10 @@ impl App {
             self.close(ctx);
         }
     }
+}
+
+fn percent(progress: f32) -> String {
+    format!("{} %", (progress * 100.0).floor() as u32)
 }
 
 fn shorten(s: &str, max: usize) -> String {

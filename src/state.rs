@@ -7,9 +7,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Position {
     pub page: usize,
     pub panel: usize,
+    /// Pages de l'album et part lue (0 à 1), pour l'accueil.
+    pub pages: usize,
+    pub progress: f32,
 }
 
 #[derive(Default, Serialize, Deserialize)]
