@@ -198,7 +198,9 @@ pub fn button(ui: &mut Ui, glyph: Option<Icon>, text: &str, tone: Tone) -> Respo
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    let (fill, color) = match tone {
+    // Fonds sombres et presque opaques : les boutons se posent aussi sur une
+    // planche claire, et doivent s'y lire.
+    let (fill, color, stroke) = match tone {
         Tone::Primary => (
             if hovered {
                 ACCENT.gamma_multiply(1.08)
@@ -206,24 +208,32 @@ pub fn button(ui: &mut Ui, glyph: Option<Icon>, text: &str, tone: Tone) -> Respo
                 ACCENT
             },
             ON_ACCENT,
+            Stroke::NONE,
         ),
         Tone::Active => (
-            Color32::from_rgba_unmultiplied(240, 196, 92, if hovered { 64 } else { 44 }),
+            if hovered {
+                Color32::from_rgb(58, 50, 30)
+            } else {
+                Color32::from_rgb(44, 38, 24)
+            },
             ACCENT,
+            Stroke::new(1.0, ACCENT.gamma_multiply(0.7)),
         ),
         Tone::Plain => (
             if pressed {
-                Color32::from_white_alpha(40)
+                Color32::from_rgb(62, 62, 72)
             } else if hovered {
-                Color32::from_white_alpha(28)
+                Color32::from_rgb(50, 50, 58)
             } else {
-                Color32::from_white_alpha(14)
+                Color32::from_rgba_unmultiplied(26, 26, 31, 235)
             },
             TEXT,
+            Stroke::new(1.0, Color32::from_white_alpha(22)),
         ),
     };
     let painter = ui.painter();
     painter.rect_filled(rect, height / 2.0, fill);
+    painter.rect_stroke(rect, height / 2.0, stroke, egui::StrokeKind::Inside);
     let content_w = icon_w + gap + text_w;
     let mut x = rect.center().x - content_w / 2.0;
     if let Some(g) = glyph {

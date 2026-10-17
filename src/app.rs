@@ -1061,11 +1061,11 @@ impl App {
         let mut a = Actions::default();
         let mut painter = ui.painter_at(area);
         painter.set_opacity(opacity);
-        let band = Rect::from_min_size(area.min, vec2(area.width(), 92.0));
+        let band = Rect::from_min_size(area.min, vec2(area.width(), 110.0));
         widgets::shade(
             &painter,
             band,
-            Color32::from_black_alpha(190),
+            Color32::from_black_alpha(230),
             Color32::TRANSPARENT,
         );
         let inner = Rect::from_min_max(
@@ -1153,7 +1153,7 @@ impl App {
                     let mut job = egui::text::LayoutJob::simple(
                         title(&book.path),
                         FontId::proportional(14.0),
-                        Color32::from_gray(200),
+                        Color32::WHITE,
                         room,
                     );
                     job.wrap.max_rows = 1;
