@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.1]
+
+- Les boutons de la barre de lecture se lisent sur les planches claires : fond sombre, liseré, dégradé plus marqué.
+
 ## [0.2.0]
 
 - Lecture automatique (A, ou ▶ dans la barre d'outils) : passe à la case suivante (ou à la page suivante en mode page entière) toutes les 5 s ; délai réglable de 2 à 30 s (− / +), retenu d'une fois sur l'autre. Un anneau en bas à droite montre le temps restant ; elle s'arrête à la fin de l'album.
