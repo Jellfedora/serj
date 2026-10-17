@@ -15,7 +15,7 @@ fn main() {
     println!("{} pages", doc.page_count());
     for i in first..=last.min(doc.page_count() - 1) {
         let t = std::time::Instant::now();
-        let page = doc.render(i, 2000.0).unwrap();
+        let page = doc.render(i, 3600.0).unwrap();
         let rendered = t.elapsed();
         let found = panels::detect(page.width, page.height, &page.rgba, false);
         println!(
@@ -29,7 +29,7 @@ fn main() {
             image::RgbaImage::from_raw(page.width as u32, page.height as u32, page.rgba).unwrap();
         for (n, r) in found.iter().enumerate() {
             let c = image::Rgba([230, 30, 60, 255]);
-            for t in 0..6 {
+            for t in 0..10 {
                 for x in r.x0..r.x1 {
                     img.put_pixel(x as u32, (r.y0 + t).min(r.y1 - 1) as u32, c);
                     img.put_pixel(x as u32, (r.y1 - 1).saturating_sub(t) as u32, c);

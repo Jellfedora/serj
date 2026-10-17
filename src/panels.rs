@@ -72,6 +72,36 @@ impl Ink {
             .collect()
     }
 
+    /// Part de chaque bord de `r` (haut, bas, gauche, droite) couverte d'encre,
+    /// en pour cent. Une case a des bords pleins : un cadre, ou un dessin qui
+    /// va jusqu'au bord. Un personnage détouré sur du blanc n'en a pas.
+    fn edges(&self, r: Rect) -> [usize; 4] {
+        let band = (r.width().min(r.height()) / 100).max(3);
+        let (top, bottom) = (
+            r.y0..(r.y0 + band).min(r.y1),
+            r.y1.saturating_sub(band).max(r.y0)..r.y1,
+        );
+        let (left, right) = (
+            r.x0..(r.x0 + band).min(r.x1),
+            r.x1.saturating_sub(band).max(r.x0)..r.x1,
+        );
+        let across = |ys: std::ops::Range<usize>| {
+            (r.x0..r.x1)
+                .filter(|&x| ys.clone().any(|y| self.at(x, y)))
+                .count()
+                * 100
+                / r.width()
+        };
+        let down = |xs: std::ops::Range<usize>| {
+            (r.y0..r.y1)
+                .filter(|&y| xs.clone().any(|x| self.at(x, y)))
+                .count()
+                * 100
+                / r.height()
+        };
+        [across(top), across(bottom), down(left), down(right)]
+    }
+
     /// Resserre `r` sur son encre ; None s'il n'y en a presque pas.
     fn trim(&self, r: Rect) -> Option<Rect> {
         let rows = self.profile(r, true);
@@ -94,6 +124,10 @@ impl Ink {
 struct Line {
     ink: usize,
     framed: bool,
+}
+
+fn is_framed(edges: [usize; 4]) -> bool {
+    edges.iter().filter(|&&e| e >= 90).count() >= 2
 }
 
 /// Encre tolérée dans une gouttière (poussières de scan, traits qui débordent).
@@ -120,9 +154,16 @@ pub fn detect(width: usize, height: usize, rgba: &[u8], right_to_left: bool) -> 
 
     // Numéro de page, petites mentions : trop petits pour être des cases.
     let min_area = content.area() / 60;
-    let mut panels: Vec<Rect> = found.into_iter().filter(|r| r.area() >= min_area).collect();
-    if panels.is_empty() {
-        panels.push(content);
+    let panels: Vec<Rect> = found.into_iter().filter(|r| r.area() >= min_area).collect();
+
+    // Une planche, ce sont des cases cadrées. Une couverture, une page de titre
+    // ou une galerie de personnages détourés sur du blanc n'en a pas : la
+    // découper trancherait dans les dessins, on la montre entière.
+    // Une bulle ou une onomatopée qui déborde peut ronger deux bords d'une
+    // case : on se contente de deux bords pleins, et de la moitié des cases.
+    let framed = panels.iter().filter(|r| is_framed(ink.edges(**r))).count();
+    if panels.len() <= 1 || framed * 2 < panels.len() {
+        return vec![content];
     }
     panels
 }

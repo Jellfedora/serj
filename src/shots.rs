@@ -17,8 +17,17 @@ impl Shots {
     pub fn from_env() -> Option<Self> {
         let dir = PathBuf::from(std::env::var_os("SERJ_SHOTS")?);
         let _ = std::fs::create_dir_all(&dir);
-        let steps = std::env::var("SERJ_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
-        Some(Self { dir, steps_left: steps, taken: 0, waiting: None, next_at: 1.0 })
+        let steps = std::env::var("SERJ_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        Some(Self {
+            dir,
+            steps_left: steps,
+            taken: 0,
+            waiting: None,
+            next_at: 1.0,
+        })
     }
 
     /// À appeler à chaque image ; vrai quand il faut avancer d'un pas.
