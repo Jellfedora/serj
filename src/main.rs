@@ -5,17 +5,41 @@ mod loader;
 mod shots;
 mod state;
 
+/// Linux : relie la fenêtre à son icône (Wayland et X11).
+const APP_ID: &str = "serj";
+
 fn main() -> eframe::Result {
+    let arg = std::env::args_os().nth(1);
+    if arg.as_deref() == Some(std::ffi::OsStr::new("--version")) {
+        println!("serj {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     // Un PDF passé en argument (Ronnie, « Ouvrir avec », ligne de commande).
-    let open = std::env::args_os().nth(1).map(std::path::PathBuf::from);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Serj")
-            .with_inner_size([1100.0, 800.0])
-            .with_min_inner_size([480.0, 360.0])
-            .with_drag_and_drop(true),
+    let open = arg.map(std::path::PathBuf::from);
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Serj")
+        .with_app_id(APP_ID)
+        .with_inner_size([1100.0, 800.0])
+        .with_min_inner_size([480.0, 360.0])
+        .with_drag_and_drop(true);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/icon.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut options = eframe::NativeOptions {
+        viewport,
         ..Default::default()
     };
+    // Windows : DirectX 12 plutôt que Vulkan, que certains pilotes Intel font
+    // planter dès le chargement (comme pour Ronnie). WGPU_BACKEND choisit encore.
+    #[cfg(windows)]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+        setup.instance_descriptor.backends =
+            eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::GL;
+        options.wgpu_options.wgpu_setup = setup.into();
+    }
     eframe::run_native(
         "Serj",
         options,

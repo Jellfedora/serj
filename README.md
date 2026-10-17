@@ -1,0 +1,31 @@
+# Serj
+
+Lecteur de BD en PDF qui lit **case par case** : chaque case remplit l'écran,
+la caméra glisse jusqu'à la suivante. Fait pour les albums franco-belges trop
+denses pour un petit écran.
+
+Serj est un module de [Ronnie](https://github.com/Jellfedora/ronnie) : on
+l'installe depuis sa page Téléchargements. Il marche aussi tout seul.
+
+## Raccourcis
+
+| Touche | Action |
+| --- | --- |
+| → ↓ Espace, clic | case suivante |
+| ← ↑, clic dans le tiers gauche | case précédente |
+| Barre du bas | aller à une page |
+| P | page entière |
+| F | plein écran |
+| ⌘ O | ouvrir un PDF |
+| ⌘ W | fermer l'album |
+
+## Développement
+
+```
+cargo run --release
+cargo run --release --example detect -- album.pdf dossier [première] [dernière]
+```
+
+`detect` dessine les cases détectées sur chaque page, pour régler la détection
+(`src/panels.rs`). Publier une version : `scripts/release.sh X.Y.Z` (après sa
+section dans CHANGELOG.md).

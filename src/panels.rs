@@ -251,3 +251,67 @@ fn cut(ink: &Ink, r: Rect, rows: bool, min_gap: usize, loose: bool) -> Vec<Rect>
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Une page blanche de `w`×`h` où chaque rectangle est une case cadrée de
+    /// noir, remplie de gris.
+    fn page(w: usize, h: usize, boxes: &[Rect]) -> Vec<u8> {
+        let mut rgba = vec![255u8; w * h * 4];
+        for b in boxes {
+            for y in b.y0..b.y1 {
+                for x in b.x0..b.x1 {
+                    let edge = x < b.x0 + 3 || x + 3 >= b.x1 || y < b.y0 + 3 || y + 3 >= b.y1;
+                    let v = if edge { 0 } else { 120 };
+                    rgba[(y * w + x) * 4..][..3].copy_from_slice(&[v, v, v]);
+                }
+            }
+        }
+        rgba
+    }
+
+    fn r(x0: usize, y0: usize, x1: usize, y1: usize) -> Rect {
+        Rect { x0, y0, x1, y1 }
+    }
+
+    #[test]
+    fn finds_panels_in_reading_order() {
+        // Une grande case en haut, deux en bas.
+        let boxes = [r(40, 40, 760, 500), r(40, 540, 380, 1060), r(420, 540, 760, 1060)];
+        let found = detect(800, 1100, &page(800, 1100, &boxes), false);
+        assert_eq!(found, boxes);
+    }
+
+    #[test]
+    fn manga_reads_right_to_left() {
+        let boxes = [r(40, 40, 380, 500), r(420, 40, 760, 500)];
+        let found = detect(800, 540, &page(800, 540, &boxes), true);
+        assert_eq!(found, vec![boxes[1], boxes[0]]);
+    }
+
+    #[test]
+    fn whole_page_without_frames() {
+        // Deux personnages détourés (sans cadre) : la page est montrée entière.
+        let (w, h) = (800, 1100);
+        let mut rgba = vec![255u8; w * h * 4];
+        for (cx, cy) in [(220usize, 550usize), (580, 550)] {
+            for y in 0..h {
+                for x in 0..w {
+                    let (dx, dy) = (x as f32 - cx as f32, (y as f32 - cy as f32) / 3.0);
+                    if dx * dx + dy * dy < 120.0 * 120.0 {
+                        rgba[(y * w + x) * 4..][..3].copy_from_slice(&[90, 60, 140]);
+                    }
+                }
+            }
+        }
+        let found = detect(w, h, &rgba, false);
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn blank_page_has_no_panel() {
+        assert!(detect(100, 100, &vec![255u8; 100 * 100 * 4], false).is_empty());
+    }
+}
