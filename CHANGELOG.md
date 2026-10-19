@@ -2,6 +2,9 @@
 
 ## [Non publié]
 
+- Infos des albums, automatiquement : série, tome, titre et auteurs tirés du nom du fichier (même hors ligne), puis complétés en ligne — titre exact, auteurs et leur rôle, éditeur, année de première parution, ISBN (catalogue de la BnF), présentation de la série (Wikipédia), résumé de l'album (Google Books, quand son quota le permet ; sinon nouvel essai le lendemain), et pour les mangas résumé, genres et auteurs (AniList). Chaque album n'est cherché qu'une fois (cache).
+- La bibliothèque se range par série, dans l'ordre des tomes ; les cartes portent le vrai titre, comme la barre de lecture et la fenêtre.
+- Fiche de l'album (bouton « i » au survol d'une couverture, ou clic droit) : résumé, la série, auteurs, éditeur, sources ; « Corriger » pour rectifier série, tome, titre ou auteurs mal reconnus, et relancer la recherche.
 - La fenêtre s'ouvre agrandie, sur tout l'écran ; elle reste redimensionnable (F pour le vrai plein écran).
 - Zoom (page entière comme case par case) : pincement du trackpad, ⌘ molette, ⌘ + / ⌘ −, ou Z ; la vue se déplace en glissant ou à la molette ; ⌘ 0, Z ou Échap pour revenir. Le zoom revient à 100 % en changeant de case, et la lecture automatique attend pendant qu'on est zoomé.
 

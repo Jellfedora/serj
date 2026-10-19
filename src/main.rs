@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod infos;
 mod library;
 mod loader;
 mod shots;
@@ -14,6 +15,18 @@ fn main() -> eframe::Result {
     let arg = std::env::args_os().nth(1);
     if arg.as_deref() == Some(std::ffi::OsStr::new("--version")) {
         println!("serj {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    // Débogage : les infos trouvées pour des albums, sans ouvrir la fenêtre.
+    if arg.as_deref() == Some(std::ffi::OsStr::new("--infos")) {
+        let manga = std::env::var_os("SERJ_MANGA").is_some();
+        for path in std::env::args_os().skip(2) {
+            let info = infos::lookup_now(std::path::Path::new(&path), manga);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&info).unwrap_or_default()
+            );
+        }
         return Ok(());
     }
     // Un PDF passé en argument (Ronnie, « Ouvrir avec », ligne de commande).

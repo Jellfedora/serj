@@ -31,6 +31,9 @@ cargo run --release
 cargo run --release --example detect -- album.pdf dossier [première] [dernière]
 ```
 
+`serj --infos album.pdf…` affiche les infos trouvées en ligne pour des albums
+(`SERJ_MANGA=1` pour des mangas), sans ouvrir la fenêtre.
+
 `detect` dessine les cases détectées sur chaque page, pour régler la détection
 (`src/panels.rs`). Publier une version : `scripts/release.sh X.Y.Z` (après sa
 section dans CHANGELOG.md).

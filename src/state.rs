@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serj::meta::Guess;
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -53,6 +54,9 @@ pub struct State {
     pub folders: Vec<PathBuf>,
     /// Lecture automatique : secondes avant de passer à la case (ou page) suivante.
     pub auto_secs: f64,
+    /// Infos d'albums corrigées à la main (série, tome, titre, auteurs), pour
+    /// la recherche en ligne.
+    pub corrections: BTreeMap<String, Guess>,
 }
 
 impl Default for State {
@@ -63,6 +67,7 @@ impl Default for State {
             whole_page: false,
             folders: Vec::new(),
             auto_secs: 5.0,
+            corrections: BTreeMap::new(),
         }
     }
 }
@@ -109,6 +114,17 @@ impl State {
 
     pub fn set_position(&mut self, path: &Path, position: Position) {
         self.positions.insert(key(path), position);
+    }
+
+    pub fn correction(&self, path: &Path) -> Option<&Guess> {
+        self.corrections.get(&key(path))
+    }
+
+    pub fn set_correction(&mut self, path: &Path, guess: Option<Guess>) {
+        match guess {
+            Some(g) => self.corrections.insert(key(path), g),
+            None => self.corrections.remove(&key(path)),
+        };
     }
 }
 
