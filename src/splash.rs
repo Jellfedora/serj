@@ -30,7 +30,7 @@ const INK: Color32 = Color32::from_rgb(20, 18, 22);
 const PAPER: Color32 = Color32::from_rgb(250, 248, 242);
 const PANEL: Color32 = Color32::from_rgb(84, 84, 96);
 const SHEET: Color32 = Color32::from_rgb(56, 56, 66);
-const MOTTO: &str = "Tes BD, case par case";
+const MOTTO: &str = "Une case à la fois.";
 
 /// L'appli est encore cachée : on ne dessine qu'elle.
 pub fn covers_app(t: f32) -> bool {

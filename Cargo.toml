@@ -2,7 +2,7 @@
 name = "serj"
 version = "0.2.1"
 edition = "2024"
-description = "Lecteur de BD en PDF, case par case"
+description = "Lecteur de BD en PDF. Une case à la fois."
 repository = "https://github.com/Jellfedora/serj"
 
 [dependencies]

@@ -1,5 +1,7 @@
 # Serj
 
+*Une case à la fois.*
+
 Lecteur de BD en PDF qui lit **case par case** : chaque case remplit l'écran,
 la caméra glisse jusqu'à la suivante. Fait pour les albums franco-belges trop
 denses pour un petit écran.

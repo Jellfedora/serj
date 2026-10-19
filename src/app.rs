@@ -736,7 +736,7 @@ impl App {
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("Serj").size(30.0).strong().color(TEXT));
                             let under = if books.is_empty() {
-                                "Tes BD, case par case".to_string()
+                                "Une case à la fois.".to_string()
                             } else {
                                 stats.clone()
                             };
