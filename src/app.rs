@@ -1,7 +1,7 @@
 //! La fenêtre de Serj : l'accueil, puis la lecture, où une caméra glisse de
 //! case en case et assombrit le reste de la planche.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -108,6 +108,17 @@ struct Clicks {
     restart: Option<PathBuf>,
     manga: Option<PathBuf>,
     infos: Option<PathBuf>,
+    series: Option<String>,
+    close_series: bool,
+}
+
+/// Une série de la bibliothèque (au moins deux albums), et ses albums dans
+/// l'ordre des tomes, avec le libellé de leur carte.
+struct Series {
+    key: String,
+    name: String,
+    books: Vec<(PathBuf, String)>,
+    summary: Option<String>,
 }
 
 /// La fiche d'un album ouverte dans l'accueil, et la correction en cours.
@@ -142,8 +153,17 @@ pub struct App {
     library: library::Library,
     infos: Infos,
     sheet: Option<Sheet>,
+    /// Début de l'écran de démarrage (NaN avant la première image) ; None une
+    /// fois fini.
+    splash: Option<f64>,
+    /// Débogage : l'écran de démarrage figé à cet instant (`SERJ_SPLASH`).
+    splash_at: Option<f32>,
+    /// L'icône de l'appli, pour l'en-tête de l'accueil.
+    icon: Option<TextureHandle>,
     /// La recherche dans la bibliothèque.
     search: String,
+    /// La série ouverte dans la bibliothèque (son nom normalisé).
+    open_series: Option<String>,
     /// Le titre de la fenêtre, tel qu'envoyé.
     window_title: String,
     /// Les albums de l'accueil, et quand ils ont été cherchés.
@@ -170,7 +190,22 @@ impl App {
             library: library::Library::new(cc.egui_ctx.clone()),
             infos: Infos::new(cc.egui_ctx.clone()),
             sheet: None,
+            // Pas d'écran de démarrage pour les captures de test.
+            splash: std::env::var_os("SERJ_SHOTS").is_none().then_some(f64::NAN),
+            splash_at: std::env::var("SERJ_SPLASH")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            icon: image::load_from_memory(include_bytes!("../assets/icon/icon.png"))
+                .ok()
+                .map(|i| {
+                    let i = i.to_rgba8();
+                    let size = [i.width() as usize, i.height() as usize];
+                    let image = egui::ColorImage::from_rgba_unmultiplied(size, i.as_raw());
+                    cc.egui_ctx
+                        .load_texture("icone", image, TextureOptions::LINEAR)
+                }),
             search: String::new(),
+            open_series: None,
             window_title: String::new(),
             books: Vec::new(),
             books_at: None,
@@ -549,6 +584,43 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
 
+        // L'écran de démarrage, par-dessus tout ; un clic ou une touche l'abrège.
+        if let Some(at) = self.splash_at {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("splash"),
+            ));
+            crate::splash::paint(&painter, ctx.content_rect(), at);
+            if let Some(shots) = &mut self.shots {
+                shots.frame(&ctx, now, true);
+            }
+            return;
+        }
+        if let Some(start) = self.splash {
+            let start = if start.is_nan() { now } else { start };
+            self.splash = Some(start);
+            let t = (now - start) as f32;
+            let skip = ctx.input(|i| {
+                i.pointer.any_pressed()
+                    || i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+            });
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("splash"),
+            ));
+            if skip || !crate::splash::paint(&painter, ctx.content_rect(), t) {
+                self.splash = None;
+            } else {
+                ctx.request_repaint();
+                // L'appli n'apparaît qu'à la fin, sous le fondu.
+                if crate::splash::covers_app(t) {
+                    return;
+                }
+            }
+        }
+
         // Un PDF glissé dans la fenêtre.
         let dropped = ctx.input(|i| {
             i.raw
@@ -606,6 +678,47 @@ impl App {
             self.books = library::books(&self.state.recents, &self.state.folders);
             self.books_at = Some(now);
         }
+        // Le nom du fichier tout de suite, ce qu'on trouve en ligne ensuite.
+        let books = self.books.clone();
+        let infos: HashMap<PathBuf, Info> = books
+            .iter()
+            .map(|p| (p.clone(), self.info(p).clone()))
+            .collect();
+        let (series, others) = group(&books, &infos);
+        let in_progress = |state: &State, p: &PathBuf| {
+            let pos = state.position(p);
+            pos.pages > 0 && pos.progress < 0.999
+        };
+        // Le dernier album ouvert et pas fini : à la une.
+        let featured = self
+            .state
+            .recents
+            .iter()
+            .find(|p| books.contains(p) && in_progress(&self.state, p))
+            .cloned();
+        let stats = {
+            let reading = books.iter().filter(|p| in_progress(&self.state, p)).count();
+            let mut parts = vec![plural(books.len(), "album", "albums")];
+            if !series.is_empty() {
+                parts.push(plural(series.len(), "série", "séries"));
+            }
+            if reading > 0 {
+                parts.push(format!("{reading} en cours"));
+            }
+            parts.join("   ·   ")
+        };
+
+        // Une lueur chaude en haut de la page.
+        let painter = ui.painter_at(area);
+        for k in 0..12 {
+            let r = 160.0 + k as f32 * 70.0;
+            painter.circle_filled(
+                pos2(area.left() + area.width() * 0.18, area.top() - 120.0),
+                r,
+                ACCENT.gamma_multiply(0.010),
+            );
+        }
+
         let pad = if area.width() > 700.0 { 44.0 } else { 18.0 };
         let column = Rect::from_min_max(area.min + vec2(pad, 0.0), area.max - vec2(pad, 0.0));
         let mut clicks = Clicks::default();
@@ -613,20 +726,21 @@ impl App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.add_space(30.0);
+                    ui.add_space(28.0);
                     ui.horizontal(|ui| {
+                        if let Some(icon) = &self.icon {
+                            ui.add(egui::Image::from_texture((icon.id(), vec2(54.0, 54.0))));
+                            ui.add_space(4.0);
+                        }
                         ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new("Serj")
-                                    .size(32.0)
-                                    .strong()
-                                    .color(ACCENT),
-                            );
-                            ui.label(
-                                egui::RichText::new("Tes BD, case par case")
-                                    .size(14.0)
-                                    .color(MUTED),
-                            );
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("Serj").size(30.0).strong().color(TEXT));
+                            let under = if books.is_empty() {
+                                "Tes BD, case par case".to_string()
+                            } else {
+                                stats.clone()
+                            };
+                            ui.label(egui::RichText::new(under).size(13.0).color(MUTED));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let compact = ui.available_width() < 380.0;
@@ -650,25 +764,24 @@ impl App {
                         });
                     });
 
-                    if !self.state.folders.is_empty() {
-                        ui.add_space(16.0);
-                        self.folder_chips(ui, &mut clicks);
+                    let browsing = self.search.is_empty() && self.open_series.is_none();
+                    if browsing && let Some(path) = &featured {
+                        ui.add_space(26.0);
+                        self.hero(ui, path, &infos[path], &mut clicks);
                     }
-                    if !self.books.is_empty() {
-                        ui.add_space(22.0);
+                    if !books.is_empty() {
+                        ui.add_space(26.0);
                         self.search_box(ui);
                     }
+                    if !self.state.folders.is_empty() {
+                        ui.add_space(12.0);
+                        self.folder_chips(ui, &mut clicks);
+                    }
 
-                    if self.books.is_empty() {
+                    if books.is_empty() {
                         empty_library(ui);
                         return;
                     }
-                    // Le nom du fichier tout de suite, ce qu'on trouve en ligne ensuite.
-                    let books = self.books.clone();
-                    let infos: HashMap<PathBuf, Info> = books
-                        .iter()
-                        .map(|p| (p.clone(), self.info(p).clone()))
-                        .collect();
                     let query = meta::normalize(&self.search);
                     if !query.is_empty() {
                         let found: Vec<(PathBuf, String)> = books
@@ -696,20 +809,39 @@ impl App {
                         }
                         return;
                     }
-                    let (reading, rest): (Vec<PathBuf>, Vec<PathBuf>) =
-                        books.into_iter().partition(|p| {
-                            let pos = self.state.position(p);
-                            pos.pages > 0 && pos.progress < 0.999
-                        });
-                    if !reading.is_empty() {
-                        let cards: Vec<(PathBuf, String)> = reading
-                            .iter()
-                            .map(|p| (p.clone(), full_label(&infos[p], p)))
-                            .collect();
-                        self.shelf(ui, "En cours", &cards, &mut clicks);
+                    // Une série ouverte : ses albums seulement.
+                    if let Some(key) = &self.open_series {
+                        if let Some(s) = series.iter().find(|s| &s.key == key) {
+                            self.series_page(ui, s, &mut clicks);
+                            return;
+                        }
+                        clicks.close_series = true;
                     }
-                    for (name, cards) in by_series(&rest, &infos) {
-                        self.shelf(ui, &name, &cards, &mut clicks);
+                    let reading: Vec<(PathBuf, String)> = books
+                        .iter()
+                        .filter(|p| in_progress(&self.state, p) && Some(*p) != featured.as_ref())
+                        .map(|p| (p.clone(), full_label(&infos[p], p)))
+                        .collect();
+                    if !reading.is_empty() {
+                        self.shelf(ui, "En cours", &reading, &mut clicks);
+                    }
+                    if !series.is_empty() {
+                        self.series_shelf(ui, &series, &mut clicks);
+                    }
+                    let mut shown: HashSet<&PathBuf> = reading.iter().map(|(p, _)| p).collect();
+                    shown.extend(featured.iter());
+                    let rest: Vec<(PathBuf, String)> = others
+                        .iter()
+                        .filter(|(p, _)| !shown.contains(p))
+                        .cloned()
+                        .collect();
+                    if !rest.is_empty() {
+                        let name = if series.is_empty() {
+                            "Bibliothèque"
+                        } else {
+                            "Albums"
+                        };
+                        self.shelf(ui, name, &rest, &mut clicks);
                     }
                     ui.add_space(20.0);
                 });
@@ -756,6 +888,15 @@ impl App {
         }
         if let Some(path) = clicks.infos {
             self.sheet = Some(Sheet { path, draft: None });
+        }
+        // Échap referme la série (sauf pendant une saisie ou sur la fiche).
+        let typing = ctx.memory(|m| m.focused().is_some());
+        let escape = ctx.input(|i| i.key_pressed(Key::Escape));
+        if clicks.close_series || (escape && !typing && self.sheet.is_none()) {
+            self.open_series = None;
+        }
+        if let Some(key) = clicks.series {
+            self.open_series = Some(key);
         }
         if let Some(path) = clicks.open {
             self.sheet = None;
@@ -844,6 +985,345 @@ impl App {
         });
     }
 
+    /// À la une : l'album en cours, en grand, sur sa couverture agrandie et
+    /// assombrie ; un clic pour reprendre la lecture.
+    fn hero(&mut self, ui: &mut egui::Ui, path: &Path, info: &Info, clicks: &mut Clicks) {
+        let width = ui.available_width();
+        let height = (width * 0.26).clamp(230.0, 300.0);
+        let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+        let hovered = ui.rect_contains_pointer(rect);
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let painter = ui.painter_at(rect.expand(24.0));
+        let shadow = egui::epaint::Shadow {
+            offset: [0, 14],
+            blur: 36,
+            spread: 0,
+            color: Color32::from_black_alpha(140),
+        };
+        painter.add(shadow.as_shape(rect, 20));
+        painter.rect_filled(rect, 20.0, SURFACE);
+        let cover = match self.library.cover(path) {
+            library::Cover::Ready(t) => Some(t.clone()),
+            _ => None,
+        };
+        if let Some(t) = &cover {
+            // Une bande de la couverture, très agrandie : floue, comme un décor.
+            let aspect = t.size_vec2().x / t.size_vec2().y;
+            let band = (aspect / (rect.width() / rect.height())).min(1.0);
+            let uv = Rect::from_min_max(pos2(0.0, 0.3 - band / 2.0), pos2(1.0, 0.3 + band / 2.0));
+            egui::Image::from_texture((t.id(), t.size_vec2()))
+                .uv(uv)
+                .tint(Color32::from_gray(if hovered { 120 } else { 100 }))
+                .corner_radius(20.0)
+                .paint_at(ui, rect);
+        }
+        // Lisible à gauche, la couverture visible à droite.
+        let left = Rect::from_min_max(
+            rect.min,
+            pos2(rect.left() + rect.width() * 0.75, rect.bottom()),
+        );
+        widgets::shade_across(
+            &painter,
+            left,
+            Color32::from_rgba_unmultiplied(16, 16, 19, 245),
+            Color32::TRANSPARENT,
+        );
+        painter.rect_stroke(
+            rect,
+            20.0,
+            egui::Stroke::new(
+                1.0,
+                Color32::from_white_alpha(if hovered { 40 } else { 18 }),
+            ),
+            egui::StrokeKind::Inside,
+        );
+
+        // La couverture, et ce qu'on en sait.
+        let pad = 28.0;
+        let mut x = rect.left() + pad;
+        if let Some(t) = &cover {
+            let h = rect.height() - 2.0 * pad;
+            let w = h * t.size_vec2().x / t.size_vec2().y;
+            let r = Rect::from_min_size(pos2(x, rect.top() + pad), vec2(w, h));
+            let shadow = egui::epaint::Shadow {
+                offset: [0, 8],
+                blur: 22,
+                spread: 0,
+                color: Color32::from_black_alpha(170),
+            };
+            painter.add(shadow.as_shape(r, 8));
+            egui::Image::from_texture((t.id(), t.size_vec2()))
+                .corner_radius(8.0)
+                .paint_at(ui, r);
+            x = r.right() + 30.0;
+        }
+        let text_w = (rect.right() - x - pad).max(120.0);
+        let mut y = rect.top() + pad + 4.0;
+        let mut kicker = egui::TextFormat::simple(FontId::proportional(12.0), ACCENT);
+        kicker.extra_letter_spacing = 2.5;
+        let galley = painter.layout_job(egui::text::LayoutJob::single_section(
+            "REPRENDRE".into(),
+            kicker,
+        ));
+        painter.galley(pos2(x, y), galley.clone(), ACCENT);
+        y += galley.size().y + 10.0;
+        let line = |text: String, size: f32, color: Color32, rows: usize, y: &mut f32| {
+            let mut job =
+                egui::text::LayoutJob::simple(text, FontId::proportional(size), color, text_w);
+            job.wrap.max_rows = rows;
+            let galley = painter.layout_job(job);
+            painter.galley(pos2(x, *y), galley.clone(), color);
+            *y += galley.size().y + 6.0;
+        };
+        if let Some(series) = &info.series {
+            let text = match info.volume {
+                Some(v) => format!("{series}  ·  Tome {v}"),
+                None => series.clone(),
+            };
+            line(text, 15.0, Color32::from_gray(200), 1, &mut y);
+        }
+        let name = info.title.clone().unwrap_or_else(|| title(path));
+        line(name, 30.0, Color32::WHITE, 2, &mut y);
+        let credits = info.credits();
+        if !credits.is_empty() {
+            line(credits, 13.5, Color32::from_gray(170), 1, &mut y);
+        }
+
+        // L'avancement, et le bouton pour reprendre.
+        let pos = self.state.position(path);
+        let bottom = rect.bottom() - pad;
+        let track = Rect::from_min_size(pos2(x, bottom - 56.0), vec2(text_w.min(340.0), 5.0));
+        let mut done = track;
+        done.max.x = track.left() + track.width() * pos.progress.clamp(0.0, 1.0);
+        painter.rect_filled(track, 2.5, Color32::from_white_alpha(40));
+        painter.rect_filled(done, 2.5, ACCENT);
+        painter.text(
+            pos2(track.right() + 12.0, track.center().y),
+            Align2::LEFT_CENTER,
+            format!(
+                "Page {} / {}   ·   {}",
+                pos.rank(pos.page) + 1,
+                pos.pages,
+                percent(pos.progress)
+            ),
+            FontId::proportional(12.5),
+            Color32::from_gray(190),
+        );
+        let buttons = Rect::from_min_size(pos2(x, bottom - 34.0), vec2(text_w, 34.0));
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(buttons)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                if widgets::button(ui, Some(Icon::Play), "Continuer", Tone::Primary).clicked() {
+                    clicks.open = Some(path.to_path_buf());
+                }
+                if widgets::button(ui, None, "Infos", Tone::Plain).clicked() {
+                    clicks.infos = Some(path.to_path_buf());
+                }
+            },
+        );
+        if response.clicked() {
+            clicks.open = Some(path.to_path_buf());
+        }
+    }
+
+    /// Les séries, une tuile chacune : une pile de tomes.
+    fn series_shelf(&mut self, ui: &mut egui::Ui, series: &[Series], clicks: &mut Clicks) {
+        ui.add_space(30.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Séries")
+                    .size(18.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.label(
+                egui::RichText::new(series.len().to_string())
+                    .size(13.0)
+                    .color(MUTED),
+            );
+        });
+        ui.add_space(14.0);
+        let (cols, card_w, gap) = columns(ui.available_width());
+        for row in series.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for s in row {
+                    if self.series_tile(ui, s, card_w).clicked() {
+                        clicks.series = Some(s.key.clone());
+                    }
+                }
+            });
+            ui.add_space(gap);
+        }
+    }
+
+    /// La tuile d'une série : la couverture du premier tome sur une pile, le
+    /// nom, combien d'albums et combien de lus.
+    fn series_tile(&mut self, ui: &mut egui::Ui, s: &Series, width: f32) -> egui::Response {
+        let cover_h = width * 1.42;
+        let (rect, response) = ui.allocate_exact_size(vec2(width, cover_h + 58.0), Sense::click());
+        let hovered = response.hovered();
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let lift = ui.ctx().animate_bool_with_time(response.id, hovered, 0.12);
+        let painter = ui.painter_at(rect.expand(20.0));
+        // De la place en haut à droite pour la pile.
+        let slot = Rect::from_min_size(
+            rect.min + vec2(0.0, 12.0 - 5.0 * lift),
+            vec2(width - 14.0, cover_h - 12.0),
+        );
+        let first = &s.books[0].0;
+        let cover = match self.library.cover(first) {
+            library::Cover::Ready(t) => Some(t.clone()),
+            _ => None,
+        };
+        let cover_rect = match &cover {
+            Some(t) => {
+                let size = t.size_vec2();
+                let scale = (slot.width() / size.x).min(slot.height() / size.y);
+                let fitted = size * scale;
+                Rect::from_min_size(pos2(slot.left(), slot.bottom() - fitted.y), fitted)
+            }
+            None => slot,
+        };
+        // Les tomes suivants, en pile derrière le premier.
+        let behind = s.books.len().min(3) - 1;
+        for k in (1..=behind).rev() {
+            let r = cover_rect.translate(vec2(7.0 * k as f32, -6.0 * k as f32));
+            painter.rect_filled(r, 8.0, Color32::from_gray(58 - 12 * k as u8));
+            painter.rect_stroke(
+                r,
+                8.0,
+                egui::Stroke::new(1.0, Color32::from_black_alpha(140)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let shadow = egui::epaint::Shadow {
+            offset: [0, 6 + (6.0 * lift) as i8],
+            blur: 18 + (10.0 * lift) as u8,
+            spread: 0,
+            color: Color32::from_black_alpha(150),
+        };
+        painter.add(shadow.as_shape(cover_rect, 8));
+        match &cover {
+            Some(t) => {
+                egui::Image::from_texture((t.id(), t.size_vec2()))
+                    .corner_radius(8.0)
+                    .paint_at(ui, cover_rect);
+            }
+            None => {
+                painter.rect_filled(cover_rect, 8.0, SURFACE);
+            }
+        }
+        if lift > 0.0 {
+            painter.rect_stroke(
+                cover_rect,
+                8.0,
+                egui::Stroke::new(2.0, ACCENT.gamma_multiply(lift)),
+                egui::StrokeKind::Outside,
+            );
+        }
+        let n = s.books.len();
+        widgets::badge(
+            &painter,
+            cover_rect.min + vec2(8.0, 8.0),
+            &format!("{n} albums"),
+            Color32::from_black_alpha(200),
+            TEXT,
+        );
+
+        // Où on en est dans la série.
+        let positions: Vec<Position> = s
+            .books
+            .iter()
+            .map(|(p, _)| self.state.position(p))
+            .collect();
+        let done = positions
+            .iter()
+            .filter(|p| p.pages > 0 && p.progress >= 0.999)
+            .count();
+        let progress = positions.iter().map(|p| p.progress).sum::<f32>() / n as f32;
+        if progress > 0.0 && done < n {
+            let track = Rect::from_min_max(
+                pos2(cover_rect.left() + 8.0, cover_rect.bottom() - 12.0),
+                pos2(cover_rect.right() - 8.0, cover_rect.bottom() - 8.0),
+            );
+            let mut bar = track;
+            bar.max.x = track.left() + track.width() * progress.clamp(0.0, 1.0);
+            painter.rect_filled(track.expand(1.0), 3.0, Color32::from_black_alpha(170));
+            painter.rect_filled(bar, 2.0, ACCENT);
+        }
+
+        let mut job = egui::text::LayoutJob::simple(
+            s.name.clone(),
+            FontId::proportional(13.5),
+            if hovered {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(220)
+            },
+            width,
+        );
+        job.wrap.max_rows = 2;
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        let title_h = galley.size().y;
+        painter.galley(pos2(rect.left(), slot.bottom() + 10.0), galley, TEXT);
+        let status = match done {
+            0 => format!("{n} albums"),
+            d if d == n => "Tout lu".to_string(),
+            d => format!("{d} lus sur {n}"),
+        };
+        painter.text(
+            pos2(rect.left(), slot.bottom() + 14.0 + title_h),
+            Align2::LEFT_TOP,
+            status,
+            FontId::proportional(11.5),
+            MUTED,
+        );
+        response
+    }
+
+    /// Une série ouverte : son nom, sa présentation, ses albums.
+    fn series_page(&mut self, ui: &mut egui::Ui, s: &Series, clicks: &mut Clicks) {
+        ui.add_space(26.0);
+        if widgets::button(ui, Some(Icon::Back), "Bibliothèque", Tone::Plain)
+            .on_hover_text("Échap")
+            .clicked()
+        {
+            clicks.close_series = true;
+        }
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&s.name).size(28.0).strong().color(TEXT));
+            ui.label(
+                egui::RichText::new(format!("{} albums", s.books.len()))
+                    .size(14.0)
+                    .color(MUTED),
+            );
+        });
+        let credits = self.info(&s.books[0].0).credits();
+        if !credits.is_empty() {
+            ui.label(egui::RichText::new(credits).size(14.0).color(MUTED));
+        }
+        if let Some(summary) = &s.summary {
+            ui.add_space(10.0);
+            ui.scope(|ui| {
+                ui.set_max_width(860.0);
+                ui.label(
+                    egui::RichText::new(summary)
+                        .size(14.0)
+                        .color(Color32::from_gray(205)),
+                );
+            });
+        }
+        self.shelf(ui, "Albums", &s.books, clicks);
+    }
+
     /// Une rangée de la bibliothèque : un titre, puis la grille des albums.
     fn shelf(
         &mut self,
@@ -863,11 +1343,7 @@ impl App {
         });
         ui.add_space(14.0);
 
-        // Les cartes s'élargissent pour remplir la rangée.
-        let (min_w, gap) = (150.0_f32, 26.0_f32);
-        let width = ui.available_width();
-        let cols = (((width + gap) / (min_w + gap)).floor() as usize).max(1);
-        let card_w = ((width - (cols - 1) as f32 * gap) / cols as f32).min(220.0);
+        let (cols, card_w, gap) = columns(ui.available_width());
         for row in books.chunks(cols) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
@@ -1937,28 +2413,42 @@ fn prose(ui: &mut egui::Ui, heading: &str, text: &str) {
     );
 }
 
-/// Les albums rangés par série (celles d'au moins deux albums, par nom, dans
-/// l'ordre des tomes), puis les autres. Avec le libellé de chaque carte.
-fn by_series(
+/// « 1 album », « 3 albums ».
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Les cartes s'élargissent pour remplir la rangée : combien par rangée,
+/// leur largeur, l'espace entre elles.
+fn columns(width: f32) -> (usize, f32, f32) {
+    let (min_w, gap) = (150.0_f32, 26.0_f32);
+    let cols = (((width + gap) / (min_w + gap)).floor() as usize).max(1);
+    let card_w = ((width - (cols - 1) as f32 * gap) / cols as f32).min(220.0);
+    (cols, card_w, gap)
+}
+
+/// Les séries d'au moins deux albums (par nom, leurs albums dans l'ordre des
+/// tomes), et les autres albums (par titre), avec le libellé de leur carte.
+fn group(
     books: &[PathBuf],
     infos: &HashMap<PathBuf, Info>,
-) -> Vec<(String, Vec<(PathBuf, String)>)> {
-    let mut series: BTreeMap<String, (String, Vec<&PathBuf>)> = BTreeMap::new();
+) -> (Vec<Series>, Vec<(PathBuf, String)>) {
+    let mut found: BTreeMap<String, (String, Vec<&PathBuf>)> = BTreeMap::new();
     for p in books {
         if let Some(name) = &infos[p].series {
-            series
+            found
                 .entry(meta::normalize(name))
                 .or_insert_with(|| (name.clone(), Vec::new()))
                 .1
                 .push(p);
         }
     }
-    let mut shelves = Vec::new();
+    let mut series = Vec::new();
     let mut others: Vec<&PathBuf> = books
         .iter()
         .filter(|p| infos[*p].series.is_none())
         .collect();
-    for (_, (name, mut list)) in series {
+    for (key, (name, mut list)) in found {
         if list.len() < 2 {
             others.extend(list);
             continue;
@@ -1969,29 +2459,27 @@ fn by_series(
                 full_label(&infos[*p], p),
             )
         });
-        let cards = list
+        let summary = list.iter().find_map(|p| infos[*p].series_summary.clone());
+        let books = list
             .iter()
             .map(|p| {
                 let label = infos[*p].short_title().unwrap_or_else(|| title(p));
                 ((*p).clone(), label)
             })
             .collect();
-        shelves.push((name, cards));
+        series.push(Series {
+            key,
+            name,
+            books,
+            summary,
+        });
     }
-    if !others.is_empty() {
-        others.sort_by_key(|p| meta::normalize(&full_label(&infos[*p], p)));
-        let name = if shelves.is_empty() {
-            "Bibliothèque"
-        } else {
-            "Autres albums"
-        };
-        let cards = others
-            .iter()
-            .map(|p| ((*p).clone(), full_label(&infos[*p], p)))
-            .collect();
-        shelves.push((name.to_string(), cards));
-    }
-    shelves
+    others.sort_by_key(|p| meta::normalize(&full_label(&infos[*p], p)));
+    let others = others
+        .iter()
+        .map(|p| ((*p).clone(), full_label(&infos[*p], p)))
+        .collect();
+    (series, others)
 }
 
 /// L'album répond à la recherche `query` (normalisée) : chacun de ses mots se

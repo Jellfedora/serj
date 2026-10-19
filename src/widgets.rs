@@ -276,6 +276,18 @@ pub fn shade(painter: &egui::Painter, rect: Rect, top: Color32, bottom: Color32)
     painter.add(mesh);
 }
 
+/// Fond en dégradé horizontal, de `left` à `right`.
+pub fn shade_across(painter: &egui::Painter, rect: Rect, left: Color32, right: Color32) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), left);
+    mesh.colored_vertex(rect.right_top(), right);
+    mesh.colored_vertex(rect.right_bottom(), right);
+    mesh.colored_vertex(rect.left_bottom(), left);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
+}
+
 /// Un anneau qui se remplit de 0 à 1, dans le sens des aiguilles d'une montre.
 pub fn ring(painter: &egui::Painter, center: Pos2, radius: f32, part: f32, color: Color32) {
     painter.circle_filled(center, radius + 5.0, Color32::from_black_alpha(170));

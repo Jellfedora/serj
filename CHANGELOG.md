@@ -2,6 +2,8 @@
 
 ## [Non publié]
 
+- Écran de démarrage : la planche de l'icône se dessine, la caméra plonge dans la case allumée, « SERJ » y éclate comme une onomatopée, une bulle dit la devise, puis l'image se ferme en iris. Un clic ou une touche l'abrège.
+- Accueil retravaillé : en-tête avec l'icône et le compte des albums, séries et lectures en cours ; l'album en cours à la une (« Reprendre »), sur sa couverture agrandie ; chaque série en une tuile (une pile de tomes, combien sont lus) qui s'ouvre sur ses albums et sa présentation (Échap pour revenir).
 - Les fichiers reconnus sont renommés d'après leurs infos (« Lanfeust de Troy - Tome 2 - Thanos l'incongru.pdf ») : seulement si le catalogue a reconnu l'album ou si ses infos ont été corrigées, jamais par-dessus un autre fichier. Progression, récents, couverture et infos suivent le fichier.
 - Barre de recherche dans la bibliothèque (⌘ F) : titre, série, auteur, éditeur ou genre ; Échap pour effacer.
 - Infos des albums, automatiquement : série, tome, titre et auteurs tirés du nom du fichier (même hors ligne), puis complétés en ligne — titre exact, auteurs et leur rôle, éditeur, année de première parution, ISBN (catalogue de la BnF), présentation de la série (Wikipédia), résumé de l'album (Google Books, quand son quota le permet ; sinon nouvel essai le lendemain), et pour les mangas résumé, genres et auteurs (AniList). Chaque album n'est cherché qu'une fois (cache).

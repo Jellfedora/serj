@@ -5,6 +5,7 @@ mod infos;
 mod library;
 mod loader;
 mod shots;
+mod splash;
 mod state;
 mod widgets;
 
