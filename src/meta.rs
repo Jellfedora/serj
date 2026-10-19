@@ -72,6 +72,10 @@ pub struct Info {
     pub summary: Option<String>,
     pub series_summary: Option<String>,
     pub genres: Vec<String>,
+    /// Combien de tomes compte la série, quand on le sait (AniList).
+    pub series_volumes: Option<u32>,
+    /// Où télécharger la couverture, dans l'ordre (pour un tome qu'on n'a pas).
+    pub covers: Vec<String>,
     /// Où les infos ont été trouvées : (nom de la source, adresse).
     pub sources: Vec<(String, String)>,
     /// La recherche en ligne a pu se faire (même sans rien trouver).
@@ -83,7 +87,14 @@ pub struct Info {
     pub retry_at: Option<u64>,
     /// La recherche qui a donné ces infos, pour savoir s'il faut la refaire.
     pub query: Guess,
+    /// La version de la recherche ([`INFO_FORMAT`]) : une plus ancienne est
+    /// refaite, pour ce qu'elle ne savait pas encore trouver.
+    pub format: u32,
 }
+
+/// Augmenté quand la recherche trouve de nouvelles infos (1 : le nombre de
+/// tomes de la série).
+pub const INFO_FORMAT: u32 = 1;
 
 impl Info {
     pub fn from_guess(g: &Guess) -> Self {
@@ -100,6 +111,7 @@ impl Info {
                 })
                 .collect(),
             query: g.clone(),
+            format: INFO_FORMAT,
             ..Self::default()
         }
     }
@@ -620,6 +632,18 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// Le nombre de tomes d'une série, d'après l'infobox de son article Wikipédia
+/// (« nombre d'albums = 9 » pour une BD, « nb_volumes = 72 » pour un manga).
+pub fn infobox_volumes(wikitext: &str) -> Option<u32> {
+    static FIELD: LazyLock<Regex> = LazyLock::new(|| {
+        re(r"(?im)^\s*\|\s*(?:nombre d'albums|nombre de tomes|nombre de volumes|nb_volumes|volumes)\s*=\D{0,20}?(\d{1,4})")
+    });
+    FIELD
+        .captures(wikitext)
+        .and_then(|c| c[1].parse().ok())
+        .filter(|&n| n > 0)
+}
+
 /// Enlève les balises HTML d'un texte (résumés d'AniList ou de Google Books).
 pub fn strip_html(s: &str) -> String {
     let s = s
@@ -839,6 +863,15 @@ mod tests {
             }
         );
         assert!(best_bnf(&records, &guess("Blacksad - 03 - Ame rouge"), false).is_none());
+    }
+
+    #[test]
+    fn reads_volume_counts() {
+        let bd = "{{Infobox Bande dessinée\n | titre = Lanfeust de Troy\n | nombre d'albums      = 9\n}}";
+        assert_eq!(infobox_volumes(bd), Some(9));
+        let manga = "{{Infobox Animation et bande dessinée asiatique/Manga\n| nb_volumes          = 72\n| liste_volumes = Liste\n}}";
+        assert_eq!(infobox_volumes(manga), Some(72));
+        assert_eq!(infobox_volumes("| nb_volumes = \n"), None);
     }
 
     #[test]

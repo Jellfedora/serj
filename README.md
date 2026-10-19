@@ -24,6 +24,7 @@ l'installe depuis sa page Téléchargements. Il marche aussi tout seul.
 | Z, ⌘ 0 | zoomer ×2,5 / revenir à la page entière (Échap aussi) |
 | F | plein écran |
 | ⌘ O | ouvrir un PDF |
+| Clic droit sur un album | lu / pas lu, corriger la recherche, manga… |
 | Échap, ⌘ W | revenir à la bibliothèque |
 
 ## Développement

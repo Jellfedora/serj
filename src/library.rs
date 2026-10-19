@@ -1,6 +1,7 @@
 //! La bibliothèque de l'accueil : les albums ouverts et ceux des dossiers
 //! ajoutés, avec leur couverture. Les couvertures sont rendues en tâche de fond
 //! et gardées dans le cache, pour s'afficher tout de suite la fois suivante.
+//! Celles des tomes qui manquent sont téléchargées (BnF, Open Library).
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -25,6 +26,8 @@ pub enum Cover {
 pub struct Library {
     pub covers: HashMap<PathBuf, Cover>,
     requests: Sender<PathBuf>,
+    /// Les couvertures à télécharger : la clé, et les adresses à essayer.
+    downloads: Sender<(PathBuf, Vec<String>)>,
     results: Receiver<(PathBuf, Option<egui::ColorImage>)>,
 }
 
@@ -32,6 +35,7 @@ impl Library {
     pub fn new(repaint: egui::Context) -> Self {
         let (requests, inbox) = channel::<PathBuf>();
         let (outbox, results) = channel();
+        let (outbox_web, repaint_web) = (outbox.clone(), repaint.clone());
         std::thread::Builder::new()
             .name("serj-couvertures".into())
             .spawn(move || {
@@ -41,9 +45,27 @@ impl Library {
                 }
             })
             .expect("thread des couvertures");
+        // À part : le réseau ne retarde pas les couvertures des PDF.
+        let (downloads, inbox) = channel::<(PathBuf, Vec<String>)>();
+        let outbox = outbox_web;
+        std::thread::Builder::new()
+            .name("serj-couvertures-web".into())
+            .spawn(move || {
+                let agent = ureq::Agent::config_builder()
+                    .timeout_global(Some(std::time::Duration::from_secs(15)))
+                    .build()
+                    .new_agent();
+                for (key, urls) in inbox {
+                    let image = urls.iter().find_map(|url| download(&agent, url));
+                    let _ = outbox.send((key, image));
+                    repaint_web.request_repaint();
+                }
+            })
+            .expect("thread des couvertures en ligne");
         Self {
             covers: HashMap::new(),
             requests,
+            downloads,
             results,
         }
     }
@@ -71,18 +93,75 @@ impl Library {
         }
         &self.covers[path]
     }
+
+    /// La couverture d'un album qu'on n'a pas, d'après `urls` (la première
+    /// qui donne une image), rangée sous `key`.
+    pub fn web_cover(&mut self, key: &Path, urls: &[String]) -> &Cover {
+        if !self.covers.contains_key(key) {
+            if urls.is_empty() {
+                return &Cover::Failed;
+            }
+            let _ = self.downloads.send((key.to_path_buf(), urls.to_vec()));
+            self.covers.insert(key.to_path_buf(), Cover::Pending);
+        }
+        &self.covers[key]
+    }
 }
 
-/// Les albums à montrer : les récents d'abord (dans leur ordre), puis ceux des
-/// dossiers, par nom.
-pub fn books(recents: &[PathBuf], folders: &[PathBuf]) -> Vec<PathBuf> {
+/// Une image en ligne, depuis le cache sinon téléchargée.
+fn download(agent: &ureq::Agent, url: &str) -> Option<egui::ColorImage> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    let cached = directories::ProjectDirs::from("", "", "Serj").map(|d| {
+        d.cache_dir()
+            .join("couvertures")
+            .join(format!("web-{:016x}.png", hasher.finish()))
+    });
+    let image = match cached.as_ref().and_then(|f| image::open(f).ok()) {
+        Some(i) => i.to_rgba8(),
+        None => {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let bytes = agent
+                .get(url)
+                .header("User-Agent", concat!("Serj/", env!("CARGO_PKG_VERSION")))
+                .call()
+                .ok()?
+                .body_mut()
+                .with_config()
+                .limit(10 << 20)
+                .read_to_vec()
+                .ok()?;
+            // Une page d'erreur, ou une image vide (un pixel), n'est pas une couverture.
+            let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            if image.width() < 40 || image.height() < 40 {
+                return None;
+            }
+            if let Some(file) = &cached {
+                if let Some(dir) = file.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = image.save(file);
+            }
+            image
+        }
+    };
+    let size = [image.width() as usize, image.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        image.as_raw(),
+    ))
+}
+
+/// Les albums à montrer : les récents d'abord (dans leur ordre), puis ceux
+/// ajoutés et ceux des dossiers, par nom.
+pub fn books(recents: &[PathBuf], files: &[PathBuf], folders: &[PathBuf]) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut books: Vec<PathBuf> = recents
         .iter()
         .filter(|p| p.exists() && seen.insert((*p).clone()))
         .cloned()
         .collect();
-    let mut found = Vec::new();
+    let mut found: Vec<PathBuf> = files.iter().filter(|p| p.exists()).cloned().collect();
     for folder in folders {
         scan(folder, 0, &mut found);
     }

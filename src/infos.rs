@@ -26,6 +26,9 @@ struct Job {
     path: PathBuf,
     guess: Guess,
     manga: bool,
+    /// La recherche part d'infos corrigées à la main : elles priment sur
+    /// celles du catalogue.
+    corrected: bool,
     /// Chercher de nouveau même si le cache a une réponse.
     force: bool,
 }
@@ -114,10 +117,24 @@ impl Infos {
                 path: path.to_path_buf(),
                 guess,
                 manga,
+                corrected: correction.is_some(),
                 force,
             });
         }
         &self.map[path]
+    }
+
+    /// Les infos du tome `volume` de la série `series`, que la bibliothèque n'a
+    /// pas : cherchées comme celles d'un album, sous une clé à part.
+    pub fn volume(&mut self, series: &str, volume: u32, manga: bool) -> (PathBuf, &Info) {
+        let key = volume_key(series, volume);
+        let guess = Guess {
+            series: Some(series.to_string()),
+            volume: Some(volume),
+            ..Guess::default()
+        };
+        self.get(&key, manga, Some(&guess));
+        (key.clone(), &self.map[&key])
     }
 
     /// Cherche de nouveau en ligne, sans le cache.
@@ -128,6 +145,7 @@ impl Infos {
             path: path.to_path_buf(),
             guess,
             manga,
+            corrected: correction.is_some(),
             force: true,
         });
     }
@@ -140,7 +158,12 @@ impl Infos {
 
 /// Cherche les infos de `path` tout de suite, sans le cache (`serj --infos`).
 pub fn lookup_now(path: &Path, manga: bool) -> Info {
-    Worker::new().lookup(&file_guess(path), manga)
+    Worker::new().lookup(&file_guess(path), manga, false)
+}
+
+/// La clé d'un tome qu'on n'a pas (aucun fichier ne porte ce nom).
+pub fn volume_key(series: &str, volume: u32) -> PathBuf {
+    PathBuf::from(format!("serj-tome-manquant:{}:{volume}", meta::normalize(series)))
 }
 
 /// Ce que dit le nom du fichier.
@@ -188,8 +211,8 @@ enum Failure {
 
 struct Worker {
     agent: ureq::Agent,
-    /// La présentation de chaque série, cherchée une seule fois.
-    series: HashMap<String, Option<(String, String)>>,
+    /// L'article de chaque série, cherché une seule fois.
+    series: HashMap<String, Option<Article>>,
 }
 
 impl Worker {
@@ -213,13 +236,14 @@ impl Worker {
         if let Some(info) = &cached
             && !job.force
             && info.searched
+            && info.format >= meta::INFO_FORMAT
             && info.manga == job.manga
             && info.query == job.guess
             && info.retry_at.is_none_or(|t| now() < t)
         {
             return info.clone();
         }
-        let info = self.lookup(&job.guess, job.manga);
+        let info = self.lookup(&job.guess, job.manga, job.corrected);
         if info.searched {
             save(&job.path, &info);
         }
@@ -230,7 +254,7 @@ impl Worker {
         }
     }
 
-    fn lookup(&mut self, guess: &Guess, manga: bool) -> Info {
+    fn lookup(&mut self, guess: &Guess, manga: bool, corrected: bool) -> Info {
         let mut info = Info::from_guess(guess);
         info.manga = manga;
         let mut reached = false;
@@ -245,8 +269,24 @@ impl Worker {
                     // ceux d'une notice (« One piece magazine. Vol »).
                     info.series = info.series.or(f.series);
                     info.volume = info.volume.or(f.volume);
-                    info.title = f.title.or(info.title);
-                    if !f.authors.is_empty() {
+                    // Un titre corrigé à la main reste tel quel ; celui du nom
+                    // de fichier a souvent perdu ses accents et apostrophes.
+                    info.title = if corrected {
+                        info.title.or(f.title)
+                    } else {
+                        f.title.or(info.title)
+                    };
+                    // Les auteurs du catalogue (avec leur rôle), sauf si on en
+                    // a indiqué d'autres.
+                    let names = |a: &[Author]| {
+                        let mut n: Vec<String> = a.iter().map(|a| meta::normalize(&a.name)).collect();
+                        n.sort();
+                        n
+                    };
+                    let others = corrected
+                        && !info.authors.is_empty()
+                        && names(&info.authors) != names(&f.authors);
+                    if !f.authors.is_empty() && !others {
                         info.authors = f.authors;
                     }
                     info.publisher = f.publisher;
@@ -254,6 +294,17 @@ impl Worker {
                     info.pages = f.pages;
                     info.isbn = f.isbns.first().cloned();
                     isbns = f.isbns;
+                    // La couverture : celle de la notice, sinon d'après l'ISBN.
+                    if let Some(ark) = f.link.as_deref().and_then(|l| l.find("ark:").map(|i| &l[i..])) {
+                        info.covers.push(format!(
+                            "https://catalogue.bnf.fr/couverture?appName=NE&idArk={ark}&couverture=1"
+                        ));
+                    }
+                    for isbn in isbns.iter().take(2) {
+                        info.covers.push(format!(
+                            "https://covers.openlibrary.org/b/isbn/{isbn}-M.jpg?default=false"
+                        ));
+                    }
                     if let Some(link) = f.link {
                         info.sources.push(("BnF".into(), link));
                     }
@@ -286,6 +337,7 @@ impl Worker {
             if let Some(a) = found {
                 info.series_summary = a.summary;
                 info.genres = a.genres;
+                info.series_volumes = a.volumes;
                 if info.authors.is_empty() {
                     info.authors = a.authors;
                 }
@@ -297,13 +349,16 @@ impl Worker {
             }
         }
 
-        // La série présentée par Wikipédia.
+        // La série présentée par Wikipédia, et combien elle compte de tomes.
         if let Some(name) = info.series.clone().or_else(|| info.title.clone()) {
             match self.wikipedia(&name, manga) {
-                Ok(Some((extract, link))) => {
+                Ok(Some(article)) => {
                     reached = true;
-                    info.series_summary.get_or_insert(extract);
-                    info.sources.push(("Wikipédia".into(), link));
+                    if let Some(extract) = article.extract {
+                        info.series_summary.get_or_insert(extract);
+                    }
+                    info.series_volumes = info.series_volumes.max(article.volumes);
+                    info.sources.push(("Wikipédia".into(), article.link));
                 }
                 Ok(None) => reached = true,
                 Err(_) => {}
@@ -405,8 +460,9 @@ impl Worker {
         Ok(summary.map(|s| (s, link)))
     }
 
-    /// L'introduction de l'article Wikipédia de la série.
-    fn wikipedia(&mut self, name: &str, manga: bool) -> Result<Option<(String, String)>, Failure> {
+    /// L'article Wikipédia de la série : son introduction, et le nombre de
+    /// tomes que donne son infobox.
+    fn wikipedia(&mut self, name: &str, manga: bool) -> Result<Option<Article>, Failure> {
         let key = meta::normalize(name);
         if let Some(found) = self.series.get(&key) {
             return Ok(found.clone());
@@ -441,10 +497,13 @@ impl Worker {
                     api,
                     &[
                         ("action", "query"),
-                        ("prop", "extracts|info"),
+                        ("prop", "extracts|info|revisions"),
                         ("exintro", "1"),
                         ("explaintext", "1"),
                         ("inprop", "url"),
+                        ("rvprop", "content"),
+                        ("rvslots", "main"),
+                        ("rvsection", "0"),
                         ("redirects", "1"),
                         ("titles", title),
                         ("format", "json"),
@@ -453,9 +512,19 @@ impl Worker {
                 let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 v["query"]["pages"].as_object().and_then(|pages| {
                     let p = pages.values().next()?;
-                    let extract = p["extract"].as_str()?.trim();
-                    let link = p["fullurl"].as_str()?.to_string();
-                    (extract.len() > 40).then(|| (shorten(extract, 1400), link))
+                    let extract = p["extract"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|e| e.len() > 40)
+                        .map(|e| shorten(e, 1400));
+                    let volumes = p["revisions"][0]["slots"]["main"]["*"]
+                        .as_str()
+                        .and_then(meta::infobox_volumes);
+                    (extract.is_some() || volumes.is_some()).then(|| Article {
+                        extract,
+                        link: p["fullurl"].as_str().unwrap_or(api).to_string(),
+                        volumes,
+                    })
                 })
             }
             None => None,
@@ -470,7 +539,7 @@ impl Worker {
         };
         std::thread::sleep(PAUSE);
         let query = "query($s:String){Media(search:$s,type:MANGA){title{romaji english} \
-            description(asHtml:false) genres startDate{year} siteUrl \
+            description(asHtml:false) genres volumes startDate{year} siteUrl \
             staff(perPage:4){edges{role node{name{full}}}}}}";
         let body = serde_json::json!({ "query": query, "variables": { "s": name } });
         let response = self
@@ -541,6 +610,7 @@ impl Worker {
                 })
                 .unwrap_or_default(),
             year: m["startDate"]["year"].as_u64().map(|y| y as u32),
+            volumes: m["volumes"].as_u64().map(|v| v as u32).filter(|&v| v > 0),
             authors,
             link: m["siteUrl"]
                 .as_str()
@@ -550,11 +620,20 @@ impl Worker {
     }
 }
 
+#[derive(Clone)]
+struct Article {
+    extract: Option<String>,
+    link: String,
+    volumes: Option<u32>,
+}
+
 struct Manga {
     title: Option<String>,
     summary: Option<String>,
     genres: Vec<String>,
     year: Option<u32>,
+    /// Le nombre de tomes, une fois la série finie.
+    volumes: Option<u32>,
     authors: Vec<Author>,
     link: String,
 }

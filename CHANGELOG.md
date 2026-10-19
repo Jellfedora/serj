@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+- Marquer un album comme lu ou pas encore lu (clic droit sur sa carte, ou sa fiche), même sans l'avoir lu dans Serj ; « Tout marquer comme lu » sur la page d'une série.
+- Tomes manquants d'une série : les trous dans la numérotation et les tomes après le dernier (le nombre de tomes vient de l'infobox Wikipédia, ou d'AniList pour un manga), en cartes sur la page de la série (couverture, titre, année et éditeur trouvés en ligne ; auteurs et résumé au survol, la notice au clic) et en compte sur sa tuile. Les infos déjà en cache sont recherchées une fois de plus pour l'apprendre.
+- Corriger la recherche : directement depuis le clic droit sur une carte ; on peut y dire si c'est une BD ou un manga. Le titre et les auteurs corrigés priment sur ceux du catalogue.
+- « À propos » (le numéro de version dans l'en-tête) : vérifier les mises à jour, liens vers GitHub, les versions et les tickets, raccourcis, nouveautés de chaque version.
+- Les liens des fiches (BnF, Wikipédia, Google Books, AniList) s'ouvrent dans le navigateur.
+- Un seul bouton « Ajouter des BD » : plusieurs PDF et dossiers d'un coup (sur macOS ; ailleurs des PDF, les dossiers se glissent dans la fenêtre). Glisser plusieurs PDF ou des dossiers les ajoute à la bibliothèque.
+
 ## [0.3.0]
 
 - Mises à jour depuis Serj : une nouvelle version est cherchée au lancement (puis toutes les six heures) ; « Mettre à jour » télécharge l'archive de ton système, la vérifie (empreinte SHA-256 publiée par GitHub), remplace l'appli et propose de redémarrer. Installé par Ronnie, Serj lui dit sa nouvelle version.

@@ -17,9 +17,42 @@ pub struct Position {
     pub progress: f32,
     /// Manga : pages lues de la dernière à la première, cases de droite à gauche.
     pub manga: bool,
+    /// Marqué comme lu à la main (même sans l'avoir lu dans Serj).
+    pub read: bool,
 }
 
 impl Position {
+    /// Ouvert au moins une fois dans Serj.
+    pub fn started(&self) -> bool {
+        self.pages > 0
+    }
+
+    /// Lu jusqu'au bout, ou marqué comme lu.
+    pub fn finished(&self) -> bool {
+        self.read || (self.started() && self.progress >= 0.999)
+    }
+
+    /// Commencé et pas fini.
+    pub fn in_progress(&self) -> bool {
+        self.started() && !self.finished()
+    }
+
+    /// Marque l'album comme lu, ou comme pas encore lu : on le reprendra alors
+    /// au début.
+    pub fn mark_read(&mut self, read: bool) {
+        if read {
+            self.read = true;
+            if self.started() {
+                self.progress = 1.0;
+            }
+        } else {
+            *self = Position {
+                manga: self.manga,
+                ..Position::default()
+            };
+        }
+    }
+
     /// Rang de `page` dans l'ordre de lecture (et inversement : la page d'un
     /// rang) ; à l'envers pour un manga.
     pub fn rank(&self, page: usize) -> usize {
@@ -52,6 +85,8 @@ pub struct State {
     pub whole_page: bool,
     /// Dossiers dont les PDF sont montrés dans la bibliothèque de l'accueil.
     pub folders: Vec<PathBuf>,
+    /// PDF ajoutés un par un à la bibliothèque.
+    pub files: Vec<PathBuf>,
     /// Lecture automatique : secondes avant de passer à la case (ou page) suivante.
     pub auto_secs: f64,
     /// Infos d'albums corrigées à la main (série, tome, titre, auteurs), pour
@@ -68,6 +103,7 @@ impl Default for State {
             positions: BTreeMap::new(),
             whole_page: false,
             folders: Vec::new(),
+            files: Vec::new(),
             auto_secs: 5.0,
             corrections: BTreeMap::new(),
             theme: "nuit".into(),
@@ -111,6 +147,22 @@ impl State {
         self.recents.truncate(MAX_RECENTS);
     }
 
+    /// Ajoute des PDF et des dossiers à la bibliothèque.
+    pub fn add(&mut self, paths: Vec<PathBuf>) {
+        for p in paths {
+            let list = if p.is_dir() {
+                &mut self.folders
+            } else if crate::app::is_pdf(&p) {
+                &mut self.files
+            } else {
+                continue;
+            };
+            if !list.contains(&p) {
+                list.push(p);
+            }
+        }
+    }
+
     pub fn position(&self, path: &Path) -> Position {
         self.positions.get(&key(path)).copied().unwrap_or_default()
     }
@@ -122,7 +174,7 @@ impl State {
     /// L'album `from` s'appelle maintenant `to` : sa place, sa correction et
     /// son rang dans les récents le suivent.
     pub fn renamed(&mut self, from: &Path, to: &Path) {
-        for p in &mut self.recents {
+        for p in self.recents.iter_mut().chain(&mut self.files) {
             if p == from {
                 *p = to.to_path_buf();
             }

@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const REPO: &str = "Jellfedora/serj";
+pub const REPO: &str = "Jellfedora/serj";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// La cible dans le nom des archives (sur macOS, Apple Silicon seulement).
 const TARGET: &str = if cfg!(target_os = "macos") {
