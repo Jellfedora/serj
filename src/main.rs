@@ -23,6 +23,8 @@ fn main() -> eframe::Result {
         .with_title("Serj")
         .with_app_id(APP_ID)
         .with_inner_size([1100.0, 800.0])
+        // Ouverte en grand : toute la place de l'écran, mais redimensionnable.
+        .with_maximized(true)
         .with_min_inner_size([480.0, 360.0])
         .with_drag_and_drop(true);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/icon.png")) {
