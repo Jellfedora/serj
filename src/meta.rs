@@ -141,6 +141,34 @@ impl Info {
     }
 }
 
+/// Le nom de fichier (sans extension) qui range l'album, par exemple
+/// « Lanfeust de Troy - Tome 2 - Thanos l'incongru ». Relu par [`guess`], il
+/// redonne la même série, le même tome et le même titre.
+pub fn file_name(info: &Info) -> Option<String> {
+    let name = match (&info.series, info.volume, &info.title) {
+        (Some(s), Some(v), Some(t)) => format!("{s} - Tome {v} - {t}"),
+        (Some(s), Some(v), None) => format!("{s} - Tome {v}"),
+        (Some(s), None, Some(t)) if normalize(s) != normalize(t) => format!("{s} - {t}"),
+        (_, _, Some(t)) => t.clone(),
+        _ => return None,
+    };
+    // Sans les caractères interdits dans un nom de fichier (macOS, Windows, Linux).
+    let clean: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    let clean: String = clean.chars().take(150).collect();
+    let clean = clean
+        .trim_matches(|c: char| c == '.' || c.is_whitespace())
+        .to_string();
+    (!clean.is_empty()).then_some(clean)
+}
+
 fn re(pattern: &str) -> Regex {
     Regex::new(pattern).expect("expression valide")
 }
@@ -688,6 +716,41 @@ mod tests {
             g(Some("One Piece"), Some(105), None, &[])
         );
         assert_eq!(guess("Maus"), g(None, None, Some("Maus"), &[]));
+    }
+
+    #[test]
+    fn names_files_so_they_read_back() {
+        let info = Info {
+            series: Some("Lanfeust de Troy".into()),
+            volume: Some(2),
+            title: Some("Thanos l'incongru".into()),
+            ..Info::default()
+        };
+        let name = file_name(&info).unwrap();
+        assert_eq!(name, "Lanfeust de Troy - Tome 2 - Thanos l'incongru");
+        assert_eq!(
+            guess(&name),
+            g(
+                Some("Lanfeust de Troy"),
+                Some(2),
+                Some("Thanos l'incongru"),
+                &[]
+            )
+        );
+        let odd = Info {
+            title: Some("Qui ? Quoi : où / quand".into()),
+            ..Info::default()
+        };
+        assert_eq!(file_name(&odd).unwrap(), "Qui Quoi où quand");
+        let manga = Info {
+            series: Some("Naruto".into()),
+            volume: Some(12),
+            ..Info::default()
+        };
+        assert_eq!(
+            guess(&file_name(&manga).unwrap()),
+            g(Some("Naruto"), Some(12), None, &[])
+        );
     }
 
     #[test]

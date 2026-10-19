@@ -2,6 +2,8 @@
 
 ## [Non publié]
 
+- Les fichiers reconnus sont renommés d'après leurs infos (« Lanfeust de Troy - Tome 2 - Thanos l'incongru.pdf ») : seulement si le catalogue a reconnu l'album ou si ses infos ont été corrigées, jamais par-dessus un autre fichier. Progression, récents, couverture et infos suivent le fichier.
+- Barre de recherche dans la bibliothèque (⌘ F) : titre, série, auteur, éditeur ou genre ; Échap pour effacer.
 - Infos des albums, automatiquement : série, tome, titre et auteurs tirés du nom du fichier (même hors ligne), puis complétés en ligne — titre exact, auteurs et leur rôle, éditeur, année de première parution, ISBN (catalogue de la BnF), présentation de la série (Wikipédia), résumé de l'album (Google Books, quand son quota le permet ; sinon nouvel essai le lendemain), et pour les mangas résumé, genres et auteurs (AniList). Chaque album n'est cherché qu'une fois (cache).
 - La bibliothèque se range par série, dans l'ordre des tomes ; les cartes portent le vrai titre, comme la barre de lecture et la fenêtre.
 - Fiche de l'album (bouton « i » au survol d'une couverture, ou clic droit) : résumé, la série, auteurs, éditeur, sources ; « Corriger » pour rectifier série, tome, titre ou auteurs mal reconnus, et relancer la recherche.

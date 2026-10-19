@@ -116,6 +116,22 @@ impl State {
         self.positions.insert(key(path), position);
     }
 
+    /// L'album `from` s'appelle maintenant `to` : sa place, sa correction et
+    /// son rang dans les récents le suivent.
+    pub fn renamed(&mut self, from: &Path, to: &Path) {
+        for p in &mut self.recents {
+            if p == from {
+                *p = to.to_path_buf();
+            }
+        }
+        if let Some(pos) = self.positions.remove(&key(from)) {
+            self.positions.insert(key(to), pos);
+        }
+        if let Some(c) = self.corrections.remove(&key(from)) {
+            self.corrections.insert(key(to), c);
+        }
+    }
+
     pub fn correction(&self, path: &Path) -> Option<&Guess> {
         self.corrections.get(&key(path))
     }

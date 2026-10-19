@@ -61,15 +61,37 @@ impl Infos {
         }
     }
 
-    /// Range les infos arrivées.
-    pub fn receive(&mut self) {
+    /// Range les infos arrivées ; renvoie les albums concernés.
+    pub fn receive(&mut self) -> Vec<PathBuf> {
+        let mut arrived = Vec::new();
         while let Ok((path, info)) = self.results.try_recv() {
             // Une réponse à une ancienne recherche (corrigée depuis) : ignorée.
             if self.map.get(&path).is_some_and(|i| i.query != info.query) {
                 continue;
             }
             self.pending.remove(&path);
-            self.map.insert(path, info);
+            self.map.insert(path.clone(), info);
+            arrived.push(path);
+        }
+        arrived
+    }
+
+    /// Les infos déjà connues de `path`, sans en demander.
+    pub fn known(&self, path: &Path) -> Option<&Info> {
+        self.map.get(path)
+    }
+
+    /// Le fichier `from` a été renommé `to`, d'après ses infos : elles le
+    /// suivent, sans nouvelle recherche (`query` : ce que dit le nouveau nom).
+    pub fn moved(&mut self, from: &Path, to: &Path, query: Guess) {
+        self.pending.remove(from);
+        if let Some(mut info) = self.map.remove(from) {
+            info.query = query;
+            save(to, &info);
+            if let Some(old) = cache_file(from) {
+                let _ = std::fs::remove_file(old);
+            }
+            self.map.insert(to.to_path_buf(), info);
         }
     }
 
@@ -148,6 +170,16 @@ fn cache_file(path: &Path) -> Option<PathBuf> {
     )
 }
 
+fn save(path: &Path, info: &Info) {
+    let Some(file) = cache_file(path) else { return };
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(info) {
+        let _ = std::fs::write(file, json);
+    }
+}
+
 /// Une requête n'a pas abouti : pas de réseau, ou service saturé.
 enum Failure {
     Offline,
@@ -188,15 +220,8 @@ impl Worker {
             return info.clone();
         }
         let info = self.lookup(&job.guess, job.manga);
-        if info.searched
-            && let Some(file) = cache_file(&job.path)
-        {
-            if let Some(dir) = file.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(json) = serde_json::to_vec_pretty(&info) {
-                let _ = std::fs::write(file, json);
-            }
+        if info.searched {
+            save(&job.path, &info);
         }
         // Hors ligne : ce qu'on avait déjà vaut mieux que le seul nom du fichier.
         match cached {

@@ -142,6 +142,8 @@ pub struct App {
     library: library::Library,
     infos: Infos,
     sheet: Option<Sheet>,
+    /// La recherche dans la bibliothèque.
+    search: String,
     /// Le titre de la fenêtre, tel qu'envoyé.
     window_title: String,
     /// Les albums de l'accueil, et quand ils ont été cherchés.
@@ -168,6 +170,7 @@ impl App {
             library: library::Library::new(cc.egui_ctx.clone()),
             infos: Infos::new(cc.egui_ctx.clone()),
             sheet: None,
+            search: String::new(),
             window_title: String::new(),
             books: Vec::new(),
             books_at: None,
@@ -218,6 +221,63 @@ impl App {
         self.auto_play = false;
         self.window_title.clear();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title("Serj".into()));
+    }
+
+    /// Donne au fichier de l'album le nom trouvé en ligne (« Lanfeust de Troy -
+    /// Tome 2 - Thanos l'incongru.pdf »), à côté de l'ancien. Seulement si le
+    /// catalogue a reconnu l'album, ou si ses infos ont été corrigées à la main ;
+    /// jamais par-dessus un autre fichier.
+    fn rename(&mut self, path: &Path) {
+        let Some(info) = self.infos.known(path) else {
+            return;
+        };
+        let trusted = self.state.correction(path).is_some()
+            || info.sources.iter().any(|(source, _)| source == "BnF");
+        if !info.searched || !trusted {
+            return;
+        }
+        let Some(name) = meta::file_name(info) else {
+            return;
+        };
+        let extension = path
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "pdf".into());
+        let target = path.with_file_name(format!("{name}.{extension}"));
+        // Déjà bien nommé, ou un autre fichier porte ce nom (macOS ignore la
+        // casse : même nom autrement écrit compris).
+        if target == path || target.exists() || !path.exists() {
+            return;
+        }
+        if std::fs::rename(path, &target).is_err() {
+            return;
+        }
+        self.state.renamed(path, &target);
+        self.state.save();
+        let query = self
+            .state
+            .correction(&target)
+            .cloned()
+            .unwrap_or_else(|| crate::infos::file_guess(&target));
+        self.infos.moved(path, &target, query);
+        if let Some(cover) = self.library.covers.remove(path) {
+            self.library.covers.insert(target.clone(), cover);
+        }
+        for b in &mut self.books {
+            if b == path {
+                *b = target.clone();
+            }
+        }
+        if let Some(book) = &mut self.book
+            && book.path == path
+        {
+            book.path = target.clone();
+        }
+        if let Some(sheet) = &mut self.sheet
+            && sheet.path == path
+        {
+            sheet.path = target;
+        }
     }
 
     /// Les infos de l'album `path` (demandées au besoin).
@@ -504,7 +564,9 @@ impl eframe::App for App {
             self.pick_file(&ctx);
         }
 
-        self.infos.receive();
+        for path in self.infos.receive() {
+            self.rename(&path);
+        }
         let area = ui.max_rect();
         ui.painter().rect_filled(area, 0.0, BACKGROUND);
         if self.book.is_some() {
@@ -592,6 +654,10 @@ impl App {
                         ui.add_space(16.0);
                         self.folder_chips(ui, &mut clicks);
                     }
+                    if !self.books.is_empty() {
+                        ui.add_space(22.0);
+                        self.search_box(ui);
+                    }
 
                     if self.books.is_empty() {
                         empty_library(ui);
@@ -603,6 +669,33 @@ impl App {
                         .iter()
                         .map(|p| (p.clone(), self.info(p).clone()))
                         .collect();
+                    let query = meta::normalize(&self.search);
+                    if !query.is_empty() {
+                        let found: Vec<(PathBuf, String)> = books
+                            .iter()
+                            .filter(|p| matches(&infos[*p], p, &query))
+                            .map(|p| (p.clone(), full_label(&infos[p], p)))
+                            .collect();
+                        if found.is_empty() {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Aucun album ne correspond")
+                                        .size(17.0)
+                                        .color(TEXT),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Cherche un titre, une série, un auteur ou un éditeur.",
+                                    )
+                                    .color(MUTED),
+                                );
+                            });
+                        } else {
+                            self.shelf(ui, "Résultats", &found, &mut clicks);
+                        }
+                        return;
+                    }
                     let (reading, rest): (Vec<PathBuf>, Vec<PathBuf>) =
                         books.into_iter().partition(|p| {
                             let pos = self.state.position(p);
@@ -669,6 +762,50 @@ impl App {
             self.open(ctx, path);
         }
         self.sheet(ctx);
+    }
+
+    /// La barre de recherche : ⌘ F pour y aller, Échap pour l'effacer.
+    fn search_box(&mut self, ui: &mut egui::Ui) {
+        let id = egui::Id::new("recherche");
+        let focus = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F));
+        let width = ui.available_width().min(520.0);
+        egui::Frame::new()
+            .fill(SURFACE)
+            .corner_radius(18)
+            .inner_margin(egui::Margin::symmetric(14, 8))
+            .show(ui, |ui| {
+                ui.set_width(width - 28.0);
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                    widgets::icon(ui.painter(), Icon::Search, r.center(), 16.0, MUTED);
+                    let has_text = !self.search.is_empty();
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .id(id)
+                            .frame(egui::Frame::NONE)
+                            .hint_text("Rechercher un album, une série, un auteur…   ⌘ F")
+                            .font(FontId::proportional(14.5))
+                            .desired_width(
+                                ui.available_width() - if has_text { 28.0 } else { 0.0 },
+                            ),
+                    );
+                    if focus {
+                        field.request_focus();
+                    }
+                    let clear = has_text
+                        && ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("×").size(16.0).color(MUTED))
+                                    .frame(false),
+                            )
+                            .on_hover_text("Effacer (Échap)")
+                            .clicked();
+                    let escape = field.has_focus() && ui.input(|i| i.key_pressed(Key::Escape));
+                    if clear || escape {
+                        self.search.clear();
+                    }
+                });
+            });
     }
 
     /// Les dossiers de la bibliothèque, en pastilles qu'on peut retirer.
@@ -1855,6 +1992,17 @@ fn by_series(
         shelves.push((name.to_string(), cards));
     }
     shelves
+}
+
+/// L'album répond à la recherche `query` (normalisée) : chacun de ses mots se
+/// trouve dans le titre, la série, les auteurs, l'éditeur ou le nom du fichier.
+fn matches(info: &Info, path: &Path, query: &str) -> bool {
+    let mut haystack = vec![full_label(info, path), title(path)];
+    haystack.extend(info.authors.iter().map(|a| a.name.clone()));
+    haystack.extend(info.publisher.clone());
+    haystack.extend(info.genres.iter().cloned());
+    let haystack = meta::normalize(&haystack.join(" "));
+    query.split(' ').all(|word| haystack.contains(word))
 }
 
 fn full_label(info: &Info, path: &Path) -> String {

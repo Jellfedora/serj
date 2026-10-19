@@ -65,6 +65,7 @@ pub enum Icon {
     Minus,
     Plus,
     Folder,
+    Search,
 }
 
 /// Dessine `icon` centrée sur `c`, dans un carré de côté `s`.
@@ -150,6 +151,13 @@ pub fn icon(painter: &egui::Painter, icon: Icon, c: Pos2, s: f32, color: Color32
         Icon::Plus => {
             line(c - vec2(h * 0.6, 0.0), c + vec2(h * 0.6, 0.0));
             line(c - vec2(0.0, h * 0.6), c + vec2(0.0, h * 0.6));
+        }
+        Icon::Search => {
+            let r = h * 0.48;
+            let lens = c - vec2(h * 0.15, h * 0.15);
+            painter.circle_stroke(lens, r, stroke);
+            let d = std::f32::consts::FRAC_1_SQRT_2;
+            line(lens + vec2(r * d, r * d), c + vec2(h * 0.75, h * 0.75));
         }
         Icon::Folder => {
             let body = Rect::from_center_size(c + vec2(0.0, h * 0.1), vec2(s * 0.8, s * 0.56));
