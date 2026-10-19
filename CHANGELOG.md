@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0]
 
 - Marquer un album comme lu ou pas encore lu (clic droit sur sa carte, ou sa fiche), même sans l'avoir lu dans Serj ; « Tout marquer comme lu » sur la page d'une série.
 - Tomes manquants d'une série : les trous dans la numérotation et les tomes après le dernier (le nombre de tomes vient de l'infobox Wikipédia, ou d'AniList pour un manga), en cartes sur la page de la série (couverture, titre, année et éditeur trouvés en ligne ; auteurs et résumé au survol, la notice au clic) et en compte sur sa tuile. Les infos déjà en cache sont recherchées une fois de plus pour l'apprendre.
