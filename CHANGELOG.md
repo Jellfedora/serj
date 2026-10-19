@@ -1,6 +1,6 @@
 # Changelog
 
-## [Non publié]
+## [0.3.0]
 
 - Mises à jour depuis Serj : une nouvelle version est cherchée au lancement (puis toutes les six heures) ; « Mettre à jour » télécharge l'archive de ton système, la vérifie (empreinte SHA-256 publiée par GitHub), remplace l'appli et propose de redémarrer. Installé par Ronnie, Serj lui dit sa nouvelle version.
 - Thèmes : Nuit, Encre bleue, Manga, Pop et Papier (clair), en pastilles dans l'en-tête de l'accueil ; retenu d'une fois sur l'autre.
