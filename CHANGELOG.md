@@ -2,6 +2,9 @@
 
 ## [Non publié]
 
+- Mises à jour depuis Serj : une nouvelle version est cherchée au lancement (puis toutes les six heures) ; « Mettre à jour » télécharge l'archive de ton système, la vérifie (empreinte SHA-256 publiée par GitHub), remplace l'appli et propose de redémarrer. Installé par Ronnie, Serj lui dit sa nouvelle version.
+- Thèmes : Nuit, Encre bleue, Manga, Pop et Papier (clair), en pastilles dans l'en-tête de l'accueil ; retenu d'une fois sur l'autre.
+- Accueil plus vivant : recherche dans l'en-tête, trame de points et lueur aux couleurs du thème, titres de rangée marqués, album à la une avec un halo.
 - Écran de démarrage : la planche de l'icône se dessine, la caméra plonge dans la case allumée, « SERJ » y éclate comme une onomatopée, une bulle dit la devise, puis l'image se ferme en iris. Un clic ou une touche l'abrège.
 - Accueil retravaillé : en-tête avec l'icône et le compte des albums, séries et lectures en cours ; l'album en cours à la une (« Reprendre »), sur sa couverture agrandie ; chaque série en une tuile (une pile de tomes, combien sont lus) qui s'ouvre sur ses albums et sa présentation (Échap pour revenir).
 - Les fichiers reconnus sont renommés d'après leurs infos (« Lanfeust de Troy - Tome 2 - Thanos l'incongru.pdf ») : seulement si le catalogue a reconnu l'album ou si ses infos ont été corrigées, jamais par-dessus un autre fichier. Progression, récents, couverture et infos suivent le fichier.

@@ -6,7 +6,7 @@
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2, pos2, vec2};
 
-use crate::widgets::{ACCENT, BACKGROUND};
+use crate::widgets::theme;
 
 /// La planche se dessine, puis sa dernière case s'allume.
 const BUILD: f32 = 0.15;
@@ -46,10 +46,14 @@ pub fn paint(painter: &egui::Painter, screen: Rect, t: f32) -> bool {
     if t >= iris_end {
         // L'appli apparaît sous le noir qui s'efface.
         let fade = 1.0 - (t - iris_end) / FADE_SECS;
-        painter.rect_filled(screen, 0.0, BACKGROUND.gamma_multiply(fade.clamp(0.0, 1.0)));
+        painter.rect_filled(
+            screen,
+            0.0,
+            theme().background.gamma_multiply(fade.clamp(0.0, 1.0)),
+        );
         return true;
     }
-    painter.rect_filled(screen, 0.0, BACKGROUND);
+    painter.rect_filled(screen, 0.0, theme().background);
 
     // La planche de l'icône : une case en haut, deux en bas.
     let h = (screen.height() * 0.46).min(420.0);
@@ -99,9 +103,13 @@ pub fn paint(painter: &egui::Painter, screen: Rect, t: f32) -> bool {
             let r = view_rect(lit);
             for k in 1..=8 {
                 let glow = r.expand(k as f32 * 6.0 * scale.min(3.0));
-                painter.rect_filled(glow, 10.0 * scale, ACCENT.gamma_multiply(0.035 * light));
+                painter.rect_filled(
+                    glow,
+                    10.0 * scale,
+                    theme().accent.gamma_multiply(0.035 * light),
+                );
             }
-            painter.rect_filled(r, 6.0 * scale, PANEL.lerp_to_gamma(ACCENT, light));
+            painter.rect_filled(r, 6.0 * scale, PANEL.lerp_to_gamma(theme().accent, light));
             let pop = ease_out_back(((t - LIGHT - 0.1) / 0.3).clamp(0.0, 1.0));
             if pop > 0.0 {
                 let c = r.center() - vec2(0.0, r.height() * 0.08);
@@ -118,7 +126,7 @@ pub fn paint(painter: &egui::Painter, screen: Rect, t: f32) -> bool {
             }
         }
     } else {
-        painter.rect_filled(screen, 0.0, ACCENT);
+        painter.rect_filled(screen, 0.0, theme().accent);
     }
 
     // Dans la case : le décor d'une onomatopée, des traits de vitesse et une
@@ -249,7 +257,7 @@ pub fn paint(painter: &egui::Painter, screen: Rect, t: f32) -> bool {
     if iris > 0.0 {
         let far = (screen.width().hypot(screen.height())) * 0.6;
         let r = far * (1.0 - ease_in(iris));
-        ring(painter, center, r, far * 1.2, BACKGROUND);
+        ring(painter, center, r, far * 1.2, theme().background);
         if r > 1.0 {
             painter.circle_stroke(center, r, Stroke::new(4.0, INK));
         }

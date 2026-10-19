@@ -57,6 +57,8 @@ pub struct State {
     /// Infos d'albums corrigées à la main (série, tome, titre, auteurs), pour
     /// la recherche en ligne.
     pub corrections: BTreeMap<String, Guess>,
+    /// Le thème de l'interface (`widgets::THEMES`).
+    pub theme: String,
 }
 
 impl Default for State {
@@ -68,6 +70,7 @@ impl Default for State {
             folders: Vec::new(),
             auto_secs: 5.0,
             corrections: BTreeMap::new(),
+            theme: "nuit".into(),
         }
     }
 }

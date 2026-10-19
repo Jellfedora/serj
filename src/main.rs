@@ -7,6 +7,7 @@ mod loader;
 mod shots;
 mod splash;
 mod state;
+mod update;
 mod widgets;
 
 /// Linux : relie la fenêtre à son icône (Wayland et X11).

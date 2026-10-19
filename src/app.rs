@@ -16,7 +16,8 @@ use crate::infos::Infos;
 use crate::library;
 use crate::loader::{Event, LoadedPage, Loader};
 use crate::state::{Position, State};
-use crate::widgets::{self, ACCENT, BACKGROUND, DIM, Icon, MUTED, ON_ACCENT, SURFACE, TEXT, Tone};
+use crate::update::{self, Updater};
+use crate::widgets::{self, Icon, THEMES, Tone, theme};
 
 /// Durée du glissement d'une case à l'autre, et du zoom en arrivant sur une page.
 const MOVE_SECS: f64 = 0.38;
@@ -110,6 +111,7 @@ struct Clicks {
     infos: Option<PathBuf>,
     series: Option<String>,
     close_series: bool,
+    theme: Option<&'static str>,
 }
 
 /// Une série de la bibliothèque (au moins deux albums), et ses albums dans
@@ -158,6 +160,10 @@ pub struct App {
     splash: Option<f64>,
     /// Débogage : l'écran de démarrage figé à cet instant (`SERJ_SPLASH`).
     splash_at: Option<f32>,
+    updater: Updater,
+    /// Dernière recherche d'une mise à jour, et si on a essayé d'en installer une.
+    update_checked_at: Option<f64>,
+    update_tried: bool,
     /// L'icône de l'appli, pour l'en-tête de l'accueil.
     icon: Option<TextureHandle>,
     /// La recherche dans la bibliothèque.
@@ -173,8 +179,6 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
-        widgets::install(&cc.egui_ctx);
-
         let mut app = Self {
             state: State::load(),
             book: None,
@@ -195,6 +199,9 @@ impl App {
             splash_at: std::env::var("SERJ_SPLASH")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            updater: Updater::new(),
+            update_checked_at: None,
+            update_tried: false,
             icon: image::load_from_memory(include_bytes!("../assets/icon/icon.png"))
                 .ok()
                 .map(|i| {
@@ -210,6 +217,7 @@ impl App {
             books: Vec::new(),
             books_at: None,
         };
+        widgets::set_theme(&cc.egui_ctx, &app.state.theme);
         // Le fichier passé en argument, sinon le dernier album lu (sauf pour
         // tester l'accueil avec SERJ_ACCUEIL).
         let reopen = std::env::var_os("SERJ_ACCUEIL").is_none();
@@ -621,6 +629,16 @@ impl eframe::App for App {
             }
         }
 
+        // Une nouvelle version ? Au lancement, puis toutes les six heures.
+        if self.shots.is_none()
+            && self
+                .update_checked_at
+                .is_none_or(|t| now - t > 6.0 * 3600.0)
+        {
+            self.updater.check(&ctx);
+            self.update_checked_at = Some(now);
+        }
+
         // Un PDF glissé dans la fenêtre.
         let dropped = ctx.input(|i| {
             i.raw
@@ -640,7 +658,7 @@ impl eframe::App for App {
             self.rename(&path);
         }
         let area = ui.max_rect();
-        ui.painter().rect_filled(area, 0.0, BACKGROUND);
+        ui.painter().rect_filled(area, 0.0, theme().background);
         if self.book.is_some() {
             self.reading(ui, &ctx, area, now);
         } else {
@@ -708,16 +726,31 @@ impl App {
             parts.join("   ·   ")
         };
 
-        // Une lueur chaude en haut de la page.
+        // Le décor : une lueur de l'accent, et une trame de points dans le coin,
+        // comme sur une page imprimée.
         let painter = ui.painter_at(area);
-        for k in 0..12 {
-            let r = 160.0 + k as f32 * 70.0;
+        for k in 0..14 {
+            let r = 140.0 + k as f32 * 64.0;
             painter.circle_filled(
-                pos2(area.left() + area.width() * 0.18, area.top() - 120.0),
+                pos2(area.left() + area.width() * 0.2, area.top() - 140.0),
                 r,
-                ACCENT.gamma_multiply(0.010),
+                theme().accent.gamma_multiply(0.012),
             );
         }
+        let corner = Rect::from_min_max(
+            pos2(area.right() - 620.0, area.top()),
+            pos2(area.right(), area.top() + 420.0),
+        );
+        widgets::halftone(
+            &painter,
+            corner,
+            area.right_top(),
+            560.0,
+            16.0,
+            theme()
+                .accent
+                .gamma_multiply(if theme().dark { 0.07 } else { 0.10 }),
+        );
 
         let pad = if area.width() > 700.0 { 44.0 } else { 18.0 };
         let column = Rect::from_min_max(area.min + vec2(pad, 0.0), area.max - vec2(pad, 0.0));
@@ -726,55 +759,94 @@ impl App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.add_space(28.0);
-                    ui.horizontal(|ui| {
-                        if let Some(icon) = &self.icon {
-                            ui.add(egui::Image::from_texture((icon.id(), vec2(54.0, 54.0))));
-                            ui.add_space(4.0);
-                        }
-                        ui.vertical(|ui| {
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new("Serj").size(30.0).strong().color(TEXT));
-                            let under = if books.is_empty() {
-                                "Une case à la fois.".to_string()
-                            } else {
-                                stats.clone()
-                            };
-                            ui.label(egui::RichText::new(under).size(13.0).color(MUTED));
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let compact = ui.available_width() < 380.0;
-                            let label = |full: &'static str| if compact { "" } else { full };
-                            clicks.add_folder |= widgets::button(
-                                ui,
-                                Some(Icon::Folder),
-                                label("Ajouter un dossier"),
-                                Tone::Plain,
-                            )
-                            .on_hover_text("Montrer ici tous les PDF d'un dossier")
-                            .clicked();
-                            clicks.pick |= widgets::button(
-                                ui,
-                                Some(Icon::Plus),
-                                label("Ouvrir un PDF"),
-                                Tone::Primary,
-                            )
-                            .on_hover_text("⌘ O, ou glisse un PDF dans la fenêtre")
-                            .clicked();
-                        });
-                    });
+                    ui.add_space(26.0);
+                    // L'en-tête : le nom à gauche, les actions et les thèmes à
+                    // droite, la recherche au milieu s'il y a la place.
+                    let mut left_end = 0.0;
+                    let mut right_start = 0.0;
+                    let header = ui
+                        .horizontal(|ui| {
+                            if let Some(icon) = &self.icon {
+                                ui.add(egui::Image::from_texture((icon.id(), vec2(56.0, 56.0))));
+                                ui.add_space(4.0);
+                            }
+                            ui.vertical(|ui| {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("Serj")
+                                        .size(30.0)
+                                        .strong()
+                                        .color(theme().text),
+                                );
+                                let under = if books.is_empty() {
+                                    "Une case à la fois.".to_string()
+                                } else {
+                                    stats.clone()
+                                };
+                                ui.label(
+                                    egui::RichText::new(under).size(13.0).color(theme().muted),
+                                );
+                            });
+                            left_end = ui.min_rect().right();
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let compact = ui.available_width() < 640.0;
+                                    let label =
+                                        |full: &'static str| if compact { "" } else { full };
+                                    clicks.add_folder |= widgets::button(
+                                        ui,
+                                        Some(Icon::Folder),
+                                        label("Ajouter un dossier"),
+                                        Tone::Plain,
+                                    )
+                                    .on_hover_text("Montrer ici tous les PDF d'un dossier")
+                                    .clicked();
+                                    clicks.pick |= widgets::button(
+                                        ui,
+                                        Some(Icon::Plus),
+                                        label("Ouvrir un PDF"),
+                                        Tone::Primary,
+                                    )
+                                    .on_hover_text("⌘ O, ou glisse un PDF dans la fenêtre")
+                                    .clicked();
+                                    ui.add_space(14.0);
+                                    clicks.theme = theme_swatches(ui);
+                                    right_start = ui.min_rect().left();
+                                },
+                            );
+                        })
+                        .response
+                        .rect;
+                    let room = right_start - left_end - 64.0;
+                    let inline_search = !books.is_empty() && room >= 300.0;
+                    if inline_search {
+                        let width = room.min(560.0);
+                        let center = pos2((left_end + right_start) / 2.0, header.center().y);
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(Rect::from_center_size(center, vec2(width, 40.0))),
+                        );
+                        self.search_box(&mut child);
+                    }
+
+                    self.update_banner(ui, ctx);
 
                     let browsing = self.search.is_empty() && self.open_series.is_none();
                     if browsing && let Some(path) = &featured {
-                        ui.add_space(26.0);
+                        ui.add_space(30.0);
                         self.hero(ui, path, &infos[path], &mut clicks);
                     }
-                    if !books.is_empty() {
-                        ui.add_space(26.0);
+                    if !books.is_empty() && !inline_search {
+                        ui.add_space(30.0);
                         self.search_box(ui);
                     }
                     if !self.state.folders.is_empty() {
-                        ui.add_space(12.0);
+                        ui.add_space(if browsing && featured.is_some() {
+                            36.0
+                        } else {
+                            20.0
+                        });
                         self.folder_chips(ui, &mut clicks);
                     }
 
@@ -795,13 +867,13 @@ impl App {
                                 ui.label(
                                     egui::RichText::new("Aucun album ne correspond")
                                         .size(17.0)
-                                        .color(TEXT),
+                                        .color(theme().text),
                                 );
                                 ui.label(
                                     egui::RichText::new(
                                         "Cherche un titre, une série, un auteur ou un éditeur.",
                                     )
-                                    .color(MUTED),
+                                    .color(theme().muted),
                                 );
                             });
                         } else {
@@ -898,6 +970,11 @@ impl App {
         if let Some(key) = clicks.series {
             self.open_series = Some(key);
         }
+        if let Some(id) = clicks.theme {
+            self.state.theme = id.to_string();
+            self.state.save();
+            widgets::set_theme(ctx, id);
+        }
         if let Some(path) = clicks.open {
             self.sheet = None;
             self.open(ctx, path);
@@ -911,14 +988,14 @@ impl App {
         let focus = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F));
         let width = ui.available_width().min(520.0);
         egui::Frame::new()
-            .fill(SURFACE)
+            .fill(theme().surface)
             .corner_radius(18)
             .inner_margin(egui::Margin::symmetric(14, 8))
             .show(ui, |ui| {
                 ui.set_width(width - 28.0);
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                    widgets::icon(ui.painter(), Icon::Search, r.center(), 16.0, MUTED);
+                    widgets::icon(ui.painter(), Icon::Search, r.center(), 16.0, theme().muted);
                     let has_text = !self.search.is_empty();
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut self.search)
@@ -936,8 +1013,10 @@ impl App {
                     let clear = has_text
                         && ui
                             .add(
-                                egui::Button::new(egui::RichText::new("×").size(16.0).color(MUTED))
-                                    .frame(false),
+                                egui::Button::new(
+                                    egui::RichText::new("×").size(16.0).color(theme().muted),
+                                )
+                                .frame(false),
                             )
                             .on_hover_text("Effacer (Échap)")
                             .clicked();
@@ -953,13 +1032,21 @@ impl App {
     fn folder_chips(&self, ui: &mut egui::Ui, clicks: &mut Clicks) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            let (r, _) = ui.allocate_exact_size(vec2(18.0, 22.0), Sense::hover());
+            widgets::icon(ui.painter(), Icon::Folder, r.center(), 14.0, theme().muted);
+            ui.label(
+                egui::RichText::new("Dossiers")
+                    .size(12.5)
+                    .color(theme().muted),
+            );
+            ui.add_space(4.0);
             for folder in &self.state.folders {
                 let name = folder
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| folder.display().to_string());
                 egui::Frame::new()
-                    .fill(SURFACE)
+                    .fill(theme().surface)
                     .corner_radius(14)
                     .inner_margin(egui::Margin {
                         left: 12,
@@ -969,12 +1056,14 @@ impl App {
                     })
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.label(egui::RichText::new(name).size(12.5).color(TEXT))
+                        ui.label(egui::RichText::new(name).size(12.5).color(theme().text))
                             .on_hover_text(folder.display().to_string());
                         let remove = ui
                             .add(
-                                egui::Button::new(egui::RichText::new("×").size(14.0).color(MUTED))
-                                    .frame(false),
+                                egui::Button::new(
+                                    egui::RichText::new("×").size(14.0).color(theme().muted),
+                                )
+                                .frame(false),
                             )
                             .on_hover_text("Retirer ce dossier de la bibliothèque");
                         if remove.clicked() {
@@ -985,25 +1074,162 @@ impl App {
         });
     }
 
+    /// Une nouvelle version : de quoi l'installer, puis redémarrer.
+    fn update_banner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let state = self.updater.state();
+        let shown = match &state {
+            update::State::Available(_)
+            | update::State::Installing(_)
+            | update::State::Installed(_) => true,
+            update::State::Failed(_) => self.update_tried,
+            _ => false,
+        };
+        if !shown {
+            return;
+        }
+        ui.add_space(24.0);
+        let t = theme();
+        egui::Frame::new()
+            .fill(t.surface.lerp_to_gamma(t.accent, 0.12))
+            .stroke(egui::Stroke::new(1.0, t.accent.gamma_multiply(0.55)))
+            .corner_radius(16)
+            .inner_margin(egui::Margin::symmetric(18, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 18.0, t.accent);
+                    widgets::icon(ui.painter(), Icon::Download, r.center(), 18.0, t.on_accent);
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        let (title, detail) = match &state {
+                            update::State::Available(a) => (
+                                format!("Serj {} est disponible", a.version),
+                                notes_summary(&a.notes),
+                            ),
+                            update::State::Installing(v) => {
+                                let (done, total) = self.updater.progress();
+                                let part = match done.saturating_mul(100).checked_div(total) {
+                                    Some(p) => format!("{p} %"),
+                                    None => format!("{} Mo", done / 1_000_000),
+                                };
+                                (
+                                    format!("Installation de Serj {v}…"),
+                                    format!("Téléchargement : {part}"),
+                                )
+                            }
+                            update::State::Installed(v) => (
+                                format!("Serj {v} est installé"),
+                                "Redémarre pour en profiter : tu retrouveras ta page.".to_string(),
+                            ),
+                            update::State::Failed(e) => {
+                                ("La mise à jour n'a pas pu se faire".to_string(), e.clone())
+                            }
+                            _ => (String::new(), String::new()),
+                        };
+                        ui.label(egui::RichText::new(title).size(15.5).strong().color(t.text));
+                        if !detail.is_empty() {
+                            ui.label(egui::RichText::new(detail).size(12.5).color(t.muted));
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        match &state {
+                            update::State::Available(a) => {
+                                if self.updater.can_install() {
+                                    if widgets::button(
+                                        ui,
+                                        Some(Icon::Download),
+                                        "Mettre à jour",
+                                        Tone::Primary,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.update_tried = true;
+                                        self.updater.install(ctx, a.clone());
+                                    }
+                                } else if widgets::button(
+                                    ui,
+                                    Some(Icon::Download),
+                                    "Télécharger",
+                                    Tone::Primary,
+                                )
+                                .on_hover_text("Cette copie de Serj ne peut pas se remplacer seule")
+                                .clicked()
+                                {
+                                    ctx.open_url(egui::OpenUrl::new_tab(&a.url));
+                                }
+                                if widgets::button(ui, None, "Nouveautés", Tone::Plain).clicked() {
+                                    ctx.open_url(egui::OpenUrl::new_tab(&a.url));
+                                }
+                            }
+                            update::State::Installing(_) => {
+                                let (done, total) = self.updater.progress();
+                                let part = if total > 0 {
+                                    done as f32 / total as f32
+                                } else {
+                                    0.0
+                                };
+                                let (r, _) =
+                                    ui.allocate_exact_size(vec2(180.0, 6.0), Sense::hover());
+                                let mut bar = r;
+                                bar.max.x = r.left() + r.width() * part;
+                                ui.painter()
+                                    .rect_filled(r, 3.0, t.text.gamma_multiply(0.12));
+                                ui.painter().rect_filled(bar, 3.0, t.accent);
+                                ctx.request_repaint_after(Duration::from_millis(150));
+                            }
+                            update::State::Installed(_) => {
+                                if widgets::button(ui, None, "Redémarrer", Tone::Primary).clicked()
+                                    && self.updater.relaunch().is_ok()
+                                {
+                                    self.save_position();
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            }
+                            update::State::Failed(_) => {
+                                let retry =
+                                    widgets::button(ui, None, "Réessayer", Tone::Plain).clicked();
+                                if retry {
+                                    self.update_tried = false;
+                                    self.updater.check(ctx);
+                                }
+                            }
+                            _ => {}
+                        }
+                    });
+                });
+            });
+    }
+
     /// À la une : l'album en cours, en grand, sur sa couverture agrandie et
     /// assombrie ; un clic pour reprendre la lecture.
     fn hero(&mut self, ui: &mut egui::Ui, path: &Path, info: &Info, clicks: &mut Clicks) {
         let width = ui.available_width();
-        let height = (width * 0.26).clamp(230.0, 300.0);
+        let height = (width * 0.27).clamp(250.0, 320.0);
         let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
         let hovered = ui.rect_contains_pointer(rect);
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        let painter = ui.painter_at(rect.expand(24.0));
+        let painter = ui.painter_at(rect.expand(60.0));
+        // Un halo de l'accent autour, et une ombre dessous.
+        let glow = egui::epaint::Shadow {
+            offset: [0, 0],
+            blur: 60,
+            spread: 2,
+            color: theme()
+                .accent
+                .gamma_multiply(if hovered { 0.30 } else { 0.18 }),
+        };
+        painter.add(glow.as_shape(rect, 20));
         let shadow = egui::epaint::Shadow {
             offset: [0, 14],
             blur: 36,
             spread: 0,
-            color: Color32::from_black_alpha(140),
+            color: Color32::from_black_alpha(if theme().dark { 140 } else { 60 }),
         };
         painter.add(shadow.as_shape(rect, 20));
-        painter.rect_filled(rect, 20.0, SURFACE);
+        painter.rect_filled(rect, 20.0, theme().surface);
         let cover = match self.library.cover(path) {
             library::Cover::Ready(t) => Some(t.clone()),
             _ => None,
@@ -1015,7 +1241,12 @@ impl App {
             let uv = Rect::from_min_max(pos2(0.0, 0.3 - band / 2.0), pos2(1.0, 0.3 + band / 2.0));
             egui::Image::from_texture((t.id(), t.size_vec2()))
                 .uv(uv)
-                .tint(Color32::from_gray(if hovered { 120 } else { 100 }))
+                .tint(Color32::from_gray(match (theme().dark, hovered) {
+                    (true, false) => 100,
+                    (true, true) => 125,
+                    (false, false) => 175,
+                    (false, true) => 200,
+                }))
                 .corner_radius(20.0)
                 .paint_at(ui, rect);
         }
@@ -1027,7 +1258,10 @@ impl App {
         widgets::shade_across(
             &painter,
             left,
-            Color32::from_rgba_unmultiplied(16, 16, 19, 245),
+            {
+                let [r, g, b, _] = theme().background.to_array();
+                Color32::from_rgba_unmultiplied(r, g, b, 245)
+            },
             Color32::TRANSPARENT,
         );
         painter.rect_stroke(
@@ -1035,7 +1269,9 @@ impl App {
             20.0,
             egui::Stroke::new(
                 1.0,
-                Color32::from_white_alpha(if hovered { 40 } else { 18 }),
+                theme()
+                    .text
+                    .gamma_multiply(if hovered { 0.22 } else { 0.1 }),
             ),
             egui::StrokeKind::Inside,
         );
@@ -1061,14 +1297,14 @@ impl App {
         }
         let text_w = (rect.right() - x - pad).max(120.0);
         let mut y = rect.top() + pad + 4.0;
-        let mut kicker = egui::TextFormat::simple(FontId::proportional(12.0), ACCENT);
-        kicker.extra_letter_spacing = 2.5;
-        let galley = painter.layout_job(egui::text::LayoutJob::single_section(
-            "REPRENDRE".into(),
-            kicker,
-        ));
-        painter.galley(pos2(x, y), galley.clone(), ACCENT);
-        y += galley.size().y + 10.0;
+        let kicker = widgets::badge(
+            &painter,
+            pos2(x, y),
+            "REPRENDRE LA LECTURE",
+            theme().accent,
+            theme().on_accent,
+        );
+        y += kicker.height() + 14.0;
         let line = |text: String, size: f32, color: Color32, rows: usize, y: &mut f32| {
             let mut job =
                 egui::text::LayoutJob::simple(text, FontId::proportional(size), color, text_w);
@@ -1082,13 +1318,13 @@ impl App {
                 Some(v) => format!("{series}  ·  Tome {v}"),
                 None => series.clone(),
             };
-            line(text, 15.0, Color32::from_gray(200), 1, &mut y);
+            line(text, 15.0, theme().text.gamma_multiply(0.8), 1, &mut y);
         }
         let name = info.title.clone().unwrap_or_else(|| title(path));
-        line(name, 30.0, Color32::WHITE, 2, &mut y);
+        line(name, 32.0, theme().text, 2, &mut y);
         let credits = info.credits();
         if !credits.is_empty() {
-            line(credits, 13.5, Color32::from_gray(170), 1, &mut y);
+            line(credits, 13.5, theme().muted, 1, &mut y);
         }
 
         // L'avancement, et le bouton pour reprendre.
@@ -1097,8 +1333,8 @@ impl App {
         let track = Rect::from_min_size(pos2(x, bottom - 56.0), vec2(text_w.min(340.0), 5.0));
         let mut done = track;
         done.max.x = track.left() + track.width() * pos.progress.clamp(0.0, 1.0);
-        painter.rect_filled(track, 2.5, Color32::from_white_alpha(40));
-        painter.rect_filled(done, 2.5, ACCENT);
+        painter.rect_filled(track, 2.5, theme().text.gamma_multiply(0.15));
+        painter.rect_filled(done, 2.5, theme().accent);
         painter.text(
             pos2(track.right() + 12.0, track.center().y),
             Align2::LEFT_CENTER,
@@ -1109,7 +1345,7 @@ impl App {
                 percent(pos.progress)
             ),
             FontId::proportional(12.5),
-            Color32::from_gray(190),
+            theme().muted,
         );
         let buttons = Rect::from_min_size(pos2(x, bottom - 34.0), vec2(text_w, 34.0));
         ui.scope_builder(
@@ -1132,21 +1368,7 @@ impl App {
 
     /// Les séries, une tuile chacune : une pile de tomes.
     fn series_shelf(&mut self, ui: &mut egui::Ui, series: &[Series], clicks: &mut Clicks) {
-        ui.add_space(30.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Séries")
-                    .size(18.0)
-                    .strong()
-                    .color(TEXT),
-            );
-            ui.label(
-                egui::RichText::new(series.len().to_string())
-                    .size(13.0)
-                    .color(MUTED),
-            );
-        });
-        ui.add_space(14.0);
+        section_title(ui, "Séries", series.len());
         let (cols, card_w, gap) = columns(ui.available_width());
         for row in series.chunks(cols) {
             ui.horizontal(|ui| {
@@ -1195,7 +1417,8 @@ impl App {
         let behind = s.books.len().min(3) - 1;
         for k in (1..=behind).rev() {
             let r = cover_rect.translate(vec2(7.0 * k as f32, -6.0 * k as f32));
-            painter.rect_filled(r, 8.0, Color32::from_gray(58 - 12 * k as u8));
+            let shade = 0.2 - 0.06 * k as f32;
+            painter.rect_filled(r, 8.0, theme().surface.lerp_to_gamma(theme().text, shade));
             painter.rect_stroke(
                 r,
                 8.0,
@@ -1217,14 +1440,14 @@ impl App {
                     .paint_at(ui, cover_rect);
             }
             None => {
-                painter.rect_filled(cover_rect, 8.0, SURFACE);
+                painter.rect_filled(cover_rect, 8.0, theme().surface);
             }
         }
         if lift > 0.0 {
             painter.rect_stroke(
                 cover_rect,
                 8.0,
-                egui::Stroke::new(2.0, ACCENT.gamma_multiply(lift)),
+                egui::Stroke::new(2.0, theme().accent.gamma_multiply(lift)),
                 egui::StrokeKind::Outside,
             );
         }
@@ -1234,7 +1457,7 @@ impl App {
             cover_rect.min + vec2(8.0, 8.0),
             &format!("{n} albums"),
             Color32::from_black_alpha(200),
-            TEXT,
+            Color32::WHITE,
         );
 
         // Où on en est dans la série.
@@ -1256,23 +1479,27 @@ impl App {
             let mut bar = track;
             bar.max.x = track.left() + track.width() * progress.clamp(0.0, 1.0);
             painter.rect_filled(track.expand(1.0), 3.0, Color32::from_black_alpha(170));
-            painter.rect_filled(bar, 2.0, ACCENT);
+            painter.rect_filled(bar, 2.0, theme().accent);
         }
 
         let mut job = egui::text::LayoutJob::simple(
             s.name.clone(),
             FontId::proportional(13.5),
             if hovered {
-                Color32::WHITE
+                theme().text
             } else {
-                Color32::from_gray(220)
+                theme().text.gamma_multiply(0.86)
             },
             width,
         );
         job.wrap.max_rows = 2;
         let galley = ui.fonts_mut(|f| f.layout_job(job));
         let title_h = galley.size().y;
-        painter.galley(pos2(rect.left(), slot.bottom() + 10.0), galley, TEXT);
+        painter.galley(
+            pos2(rect.left(), slot.bottom() + 10.0),
+            galley,
+            theme().text,
+        );
         let status = match done {
             0 => format!("{n} albums"),
             d if d == n => "Tout lu".to_string(),
@@ -1283,7 +1510,7 @@ impl App {
             Align2::LEFT_TOP,
             status,
             FontId::proportional(11.5),
-            MUTED,
+            theme().muted,
         );
         response
     }
@@ -1299,16 +1526,21 @@ impl App {
         }
         ui.add_space(18.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(&s.name).size(28.0).strong().color(TEXT));
+            ui.label(
+                egui::RichText::new(&s.name)
+                    .size(28.0)
+                    .strong()
+                    .color(theme().text),
+            );
             ui.label(
                 egui::RichText::new(format!("{} albums", s.books.len()))
                     .size(14.0)
-                    .color(MUTED),
+                    .color(theme().muted),
             );
         });
         let credits = self.info(&s.books[0].0).credits();
         if !credits.is_empty() {
-            ui.label(egui::RichText::new(credits).size(14.0).color(MUTED));
+            ui.label(egui::RichText::new(credits).size(14.0).color(theme().muted));
         }
         if let Some(summary) = &s.summary {
             ui.add_space(10.0);
@@ -1317,7 +1549,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(summary)
                         .size(14.0)
-                        .color(Color32::from_gray(205)),
+                        .color(theme().text.gamma_multiply(0.85)),
                 );
             });
         }
@@ -1332,16 +1564,7 @@ impl App {
         books: &[(PathBuf, String)],
         clicks: &mut Clicks,
     ) {
-        ui.add_space(30.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(title).size(18.0).strong().color(TEXT));
-            ui.label(
-                egui::RichText::new(books.len().to_string())
-                    .size(13.0)
-                    .color(MUTED),
-            );
-        });
-        ui.add_space(14.0);
+        section_title(ui, title, books.len());
 
         let (cols, card_w, gap) = columns(ui.available_width());
         for row in books.chunks(cols) {
@@ -1427,14 +1650,14 @@ impl App {
             }
             cover => {
                 let failed = matches!(cover, library::Cover::Failed);
-                painter.rect_filled(slot, 8.0, SURFACE);
+                painter.rect_filled(slot, 8.0, theme().surface);
                 let text = if failed { "PDF illisible" } else { "…" };
                 painter.text(
                     slot.center(),
                     Align2::CENTER_CENTER,
                     text,
                     FontId::proportional(14.0),
-                    MUTED,
+                    theme().muted,
                 );
                 slot
             }
@@ -1443,7 +1666,7 @@ impl App {
             painter.rect_stroke(
                 cover_rect,
                 8.0,
-                egui::Stroke::new(2.0, ACCENT.gamma_multiply(lift)),
+                egui::Stroke::new(2.0, theme().accent.gamma_multiply(lift)),
                 egui::StrokeKind::Outside,
             );
         }
@@ -1454,13 +1677,21 @@ impl App {
         let finished = started && pos.progress >= 0.999;
         let mut at = cover_rect.min + vec2(8.0, 8.0);
         if !started {
-            at.x = widgets::badge(&painter, at, "Nouveau", ACCENT, ON_ACCENT).right() + 6.0;
+            at.x = widgets::badge(&painter, at, "Nouveau", theme().accent, theme().on_accent)
+                .right()
+                + 6.0;
         } else if finished {
             let fill = Color32::from_black_alpha(200);
-            at.x = widgets::badge(&painter, at, "Terminé", fill, TEXT).right() + 6.0;
+            at.x = widgets::badge(&painter, at, "Terminé", fill, Color32::WHITE).right() + 6.0;
         }
         if pos.manga {
-            widgets::badge(&painter, at, "Manga", Color32::from_black_alpha(200), TEXT);
+            widgets::badge(
+                &painter,
+                at,
+                "Manga",
+                Color32::from_black_alpha(200),
+                Color32::WHITE,
+            );
         }
         if started && !finished {
             let track = Rect::from_min_max(
@@ -1470,7 +1701,7 @@ impl App {
             let mut done = track;
             done.max.x = track.left() + track.width() * pos.progress.clamp(0.0, 1.0);
             painter.rect_filled(track.expand(1.0), 3.0, Color32::from_black_alpha(170));
-            painter.rect_filled(done, 2.0, ACCENT);
+            painter.rect_filled(done, 2.0, theme().accent);
         }
 
         // Le titre, sur deux lignes au plus.
@@ -1478,16 +1709,20 @@ impl App {
             label.to_owned(),
             FontId::proportional(13.5),
             if hovered {
-                Color32::WHITE
+                theme().text
             } else {
-                Color32::from_gray(220)
+                theme().text.gamma_multiply(0.86)
             },
             width,
         );
         job.wrap.max_rows = 2;
         let galley = ui.fonts_mut(|f| f.layout_job(job));
         let title_h = galley.size().y;
-        painter.galley(pos2(rect.left(), slot.bottom() + 10.0), galley, TEXT);
+        painter.galley(
+            pos2(rect.left(), slot.bottom() + 10.0),
+            galley,
+            theme().text,
+        );
         if started && !finished {
             painter.text(
                 pos2(rect.left(), slot.bottom() + 14.0 + title_h),
@@ -1499,7 +1734,7 @@ impl App {
                     percent(pos.progress)
                 ),
                 FontId::proportional(11.5),
-                MUTED,
+                theme().muted,
             );
         }
 
@@ -1524,7 +1759,7 @@ impl App {
                 Align2::CENTER_CENTER,
                 "i",
                 FontId::proportional(17.0),
-                TEXT.gamma_multiply(lift),
+                Color32::WHITE.gamma_multiply(lift),
             );
             if button.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1559,8 +1794,8 @@ impl App {
         }
         let mut action = Do::Nothing;
         let frame = egui::Frame::new()
-            .fill(Color32::from_rgb(24, 24, 29))
-            .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(18)))
+            .fill(theme().background.lerp_to_gamma(theme().surface, 0.6))
+            .stroke(egui::Stroke::new(1.0, theme().text.gamma_multiply(0.08)))
             .corner_radius(16)
             .inner_margin(28);
         let modal = egui::Modal::new(egui::Id::new("fiche"))
@@ -1584,13 +1819,13 @@ impl App {
                                 Some(v) => format!("{series}  ·  Tome {v}"),
                                 None => series.clone(),
                             };
-                            ui.label(egui::RichText::new(text).size(13.0).strong().color(ACCENT));
+                            ui.label(egui::RichText::new(text).size(13.0).strong().color(theme().accent));
                         }
                         let name = info.title.clone().unwrap_or_else(|| title(&path));
-                        ui.label(egui::RichText::new(name).size(24.0).strong().color(TEXT));
+                        ui.label(egui::RichText::new(name).size(24.0).strong().color(theme().text));
                         ui.add_space(6.0);
                         if !info.authors.is_empty() {
-                            ui.label(egui::RichText::new(info.credits()).size(14.0).color(TEXT));
+                            ui.label(egui::RichText::new(info.credits()).size(14.0).color(theme().text));
                         }
                         let facts: Vec<String> = [
                             info.publisher.clone(),
@@ -1602,20 +1837,20 @@ impl App {
                         .flatten()
                         .collect();
                         if !facts.is_empty() {
-                            ui.label(egui::RichText::new(facts.join("   ·   ")).color(MUTED));
+                            ui.label(egui::RichText::new(facts.join("   ·   ")).color(theme().muted));
                         }
                         if !info.genres.is_empty() {
                             ui.label(
                                 egui::RichText::new(info.genres.join(", "))
                                     .size(12.5)
-                                    .color(MUTED),
+                                    .color(theme().muted),
                             );
                         }
                         ui.add_space(8.0);
                         if pending {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label(egui::RichText::new("Recherche en ligne…").color(MUTED));
+                                ui.label(egui::RichText::new("Recherche en ligne…").color(theme().muted));
                             });
                         } else if !info.searched {
                             ui.label(
@@ -1623,7 +1858,7 @@ impl App {
                                     "Hors ligne : infos tirées du nom du fichier. \
                                      Nouvel essai au prochain lancement.",
                                 )
-                                .color(MUTED),
+                                .color(theme().muted),
                             );
                         } else if info.sources.is_empty() {
                             ui.label(
@@ -1631,7 +1866,7 @@ impl App {
                                     "Rien trouvé en ligne. Corrige la série ou le titre \
                                      pour aider la recherche.",
                                 )
-                                .color(MUTED),
+                                .color(theme().muted),
                             );
                         }
                         ui.add_space(14.0);
@@ -1664,11 +1899,11 @@ impl App {
                         egui::RichText::new("Corriger les infos")
                             .size(16.0)
                             .strong()
-                            .color(TEXT),
+                            .color(theme().text),
                     );
                     ui.label(
                         egui::RichText::new("La recherche en ligne repartira de ce que tu indiques.")
-                            .color(MUTED),
+                            .color(theme().muted),
                     );
                     ui.add_space(10.0);
                     egui::Grid::new("correction")
@@ -1681,7 +1916,7 @@ impl App {
                                 ("Titre", &mut d.title, "Thanos l'incongru"),
                                 ("Auteurs", &mut d.authors, "séparés par des virgules"),
                             ] {
-                                ui.label(egui::RichText::new(name).color(MUTED));
+                                ui.label(egui::RichText::new(name).color(theme().muted));
                                 ui.add(
                                     egui::TextEdit::singleline(value)
                                         .hint_text(hint)
@@ -1724,7 +1959,7 @@ impl App {
                     if !info.sources.is_empty() {
                         ui.add_space(14.0);
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new("Sources :").size(12.0).color(MUTED));
+                            ui.label(egui::RichText::new("Sources :").size(12.0).color(theme().muted));
                             for (name, url) in &info.sources {
                                 ui.hyperlink_to(egui::RichText::new(name).size(12.0), url);
                             }
@@ -1893,7 +2128,7 @@ impl App {
                 Align2::CENTER_CENTER,
                 error,
                 FontId::proportional(18.0),
-                MUTED,
+                theme().muted,
             );
         } else if let Some(camera) = book.camera(now, whole_page) {
             let page = book.current().expect("page rendue");
@@ -1968,7 +2203,7 @@ impl App {
                     Rect::from_min_max(pos2(area.min.x, hole.min.y), pos2(hole.min.x, hole.max.y)),
                     Rect::from_min_max(pos2(hole.max.x, hole.min.y), pos2(area.max.x, hole.max.y)),
                 ] {
-                    painter.rect_filled(r, 0.0, DIM);
+                    painter.rect_filled(r, 0.0, theme().dim());
                 }
             }
             if book.camera_move.is_some() {
@@ -1985,7 +2220,7 @@ impl App {
                 Align2::CENTER_CENTER,
                 text,
                 FontId::proportional(16.0),
-                MUTED,
+                theme().muted,
             );
         }
 
@@ -2004,14 +2239,22 @@ impl App {
             let active = bar.hovered() || bar.dragged();
             let height = if active { 8.0 } else { 3.0 };
             let track = Rect::from_min_max(pos2(area.left(), area.bottom() - height), area.max);
-            painter.rect_filled(track, 0.0, Color32::from_gray(if active { 60 } else { 42 }));
+            painter.rect_filled(
+                track,
+                0.0,
+                if active {
+                    theme().raised()
+                } else {
+                    theme().surface
+                },
+            );
             let mut done = track;
             if manga {
                 done.min.x = track.right() - track.width() * progress;
             } else {
                 done.max.x = track.left() + track.width() * progress;
             }
-            painter.rect_filled(done, 0.0, ACCENT);
+            painter.rect_filled(done, 0.0, theme().accent);
             if active {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 self.hud_until = self.hud_until.max(now + 1.0);
@@ -2068,13 +2311,14 @@ impl App {
                 }
                 let mut painter = painter.clone();
                 painter.set_opacity(opacity);
-                let galley = painter.layout_no_wrap(text, FontId::proportional(14.0), TEXT);
+                let galley =
+                    painter.layout_no_wrap(text, FontId::proportional(14.0), Color32::WHITE);
                 let pill = Rect::from_center_size(
                     pos2(area.center().x, area.bottom() - 40.0),
                     galley.size() + vec2(32.0, 14.0),
                 );
                 painter.rect_filled(pill, pill.height() / 2.0, Color32::from_black_alpha(200));
-                painter.galley(pill.center() - galley.size() / 2.0, galley, TEXT);
+                painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
             }
             let (bar, hovered) = self.toolbar(ui, area, opacity, is_fullscreen, &name);
             if hovered {
@@ -2086,8 +2330,8 @@ impl App {
         // La lecture automatique : un anneau qui se remplit jusqu'au pas suivant.
         if let Some(part) = auto_part {
             let center = pos2(area.right() - 34.0, area.bottom() - 40.0);
-            widgets::ring(&painter, center, 11.0, part, ACCENT);
-            widgets::icon(&painter, Icon::Pause, center, 11.0, TEXT);
+            widgets::ring(&painter, center, 11.0, part, theme().accent);
+            widgets::icon(&painter, Icon::Pause, center, 11.0, theme().text);
         }
 
         self.apply(ctx, actions, now);
@@ -2208,7 +2452,7 @@ impl App {
                     painter.galley(
                         pos2(left, inner.center().y - galley.size().y / 2.0),
                         galley,
-                        TEXT,
+                        theme().text,
                     );
                 }
             },
@@ -2357,21 +2601,22 @@ fn empty_library(ui: &mut egui::Ui) {
     ui.add_space(90.0);
     ui.vertical_centered(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
-        ui.painter().circle_filled(r.center(), 36.0, SURFACE);
-        widgets::icon(ui.painter(), Icon::Folder, r.center(), 30.0, MUTED);
+        ui.painter()
+            .circle_filled(r.center(), 36.0, theme().surface);
+        widgets::icon(ui.painter(), Icon::Folder, r.center(), 30.0, theme().muted);
         ui.add_space(18.0);
         ui.label(
             egui::RichText::new("Ta bibliothèque est vide")
                 .size(20.0)
                 .strong()
-                .color(TEXT),
+                .color(theme().text),
         );
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
                 "Ouvre un PDF, glisse-le dans la fenêtre, ou ajoute le dossier où sont tes BD.",
             )
-            .color(MUTED),
+            .color(theme().muted),
         );
     });
 }
@@ -2404,13 +2649,101 @@ impl Draft {
 
 /// Un paragraphe de la fiche, sous son intitulé.
 fn prose(ui: &mut egui::Ui, heading: &str, text: &str) {
-    ui.label(egui::RichText::new(heading).size(15.0).strong().color(TEXT));
+    ui.label(
+        egui::RichText::new(heading)
+            .size(15.0)
+            .strong()
+            .color(theme().text),
+    );
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new(text)
             .size(14.0)
-            .color(Color32::from_gray(205)),
+            .color(theme().text.gamma_multiply(0.85)),
     );
+}
+
+/// Le titre d'une rangée : un trait de l'accent devant, comme un coup de
+/// feutre, et combien elle compte d'albums, en pastille.
+fn section_title(ui: &mut egui::Ui, title: &str, count: usize) {
+    ui.add_space(40.0);
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(6.0, 24.0), Sense::hover());
+        ui.painter().rect_filled(r, 3.0, theme().accent);
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(title)
+                .size(21.0)
+                .strong()
+                .color(theme().text),
+        );
+        ui.add_space(4.0);
+        let galley = ui.painter().layout_no_wrap(
+            count.to_string(),
+            FontId::proportional(12.0),
+            theme().muted,
+        );
+        let (r, _) = ui.allocate_exact_size(galley.size() + vec2(18.0, 8.0), Sense::hover());
+        ui.painter()
+            .rect_filled(r, r.height() / 2.0, theme().surface);
+        ui.painter()
+            .galley(r.center() - galley.size() / 2.0, galley, theme().muted);
+    });
+    ui.add_space(18.0);
+}
+
+/// Les thèmes, en pastilles de leurs couleurs (dans une mise en page de
+/// droite à gauche) ; renvoie celui qu'on choisit.
+fn theme_swatches(ui: &mut egui::Ui) -> Option<&'static str> {
+    let mut chosen = None;
+    ui.spacing_mut().item_spacing.x = 6.0;
+    for t in THEMES.iter().rev() {
+        let (r, response) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+        let current = t.id == theme().id;
+        let painter = ui.painter();
+        let c = r.center();
+        if current {
+            painter.circle_stroke(c, 11.5, egui::Stroke::new(2.0, theme().accent));
+        } else if response.hovered() {
+            painter.circle_stroke(
+                c,
+                11.5,
+                egui::Stroke::new(1.5, theme().text.gamma_multiply(0.4)),
+            );
+        }
+        painter.circle_filled(c, 8.5, t.background);
+        painter.circle_stroke(
+            c,
+            8.5,
+            egui::Stroke::new(1.0, theme().text.gamma_multiply(0.15)),
+        );
+        painter.circle_filled(c, 4.5, t.accent);
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response
+            .on_hover_text(format!("Thème {}", t.name))
+            .clicked()
+            && !current
+        {
+            chosen = Some(t.id);
+        }
+    }
+    chosen
+}
+
+/// Les premières nouveautés d'une version, d'après ses notes (le CHANGELOG).
+fn notes_summary(notes: &str) -> String {
+    let items: Vec<String> = notes
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .map(|l| {
+            let first = l.split([':', '.', '(']).next().unwrap_or(l).trim();
+            first.chars().take(60).collect()
+        })
+        .take(3)
+        .collect();
+    items.join("   ·   ")
 }
 
 /// « 1 album », « 3 albums ».

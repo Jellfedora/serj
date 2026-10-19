@@ -1,32 +1,133 @@
 //! Le thème et les petits éléments de l'interface. Les icônes sont dessinées à
 //! la main : la police par défaut n'a ni flèches, ni lecture, ni plein écran.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use egui::{
     Color32, CornerRadius, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, pos2, vec2,
 };
 
-pub const BACKGROUND: Color32 = Color32::from_rgb(16, 16, 19);
-/// Le reste de la planche, autour de la case lue : à peine visible.
-pub const DIM: Color32 = Color32::from_rgba_premultiplied(16, 16, 19, 232);
-pub const SURFACE: Color32 = Color32::from_rgb(30, 30, 35);
-pub const ACCENT: Color32 = Color32::from_rgb(240, 196, 92);
-/// Le texte posé sur l'accent.
-pub const ON_ACCENT: Color32 = Color32::from_rgb(28, 22, 8);
-pub const TEXT: Color32 = Color32::from_rgb(232, 232, 236);
-pub const MUTED: Color32 = Color32::from_rgb(140, 140, 152);
+/// Les couleurs de l'appli.
+#[derive(Clone, Copy)]
+pub struct Theme {
+    /// Son nom dans les réglages (`State::theme`).
+    pub id: &'static str,
+    pub name: &'static str,
+    pub dark: bool,
+    pub background: Color32,
+    /// Cartes, champs, boutons.
+    pub surface: Color32,
+    pub accent: Color32,
+    /// Le texte posé sur l'accent.
+    pub on_accent: Color32,
+    pub text: Color32,
+    pub muted: Color32,
+}
 
-/// Le style de toute l'appli : sombre, arrondi, aéré.
+impl Theme {
+    /// Le reste de la planche, autour de la case lue : à peine visible.
+    pub fn dim(&self) -> Color32 {
+        let [r, g, b, _] = self.background.to_array();
+        Color32::from_rgba_unmultiplied(r, g, b, 232)
+    }
+
+    /// Une surface un peu plus marquée (survol, champ actif).
+    pub fn raised(&self) -> Color32 {
+        self.surface.lerp_to_gamma(self.text, 0.08)
+    }
+}
+
+pub const THEMES: [Theme; 5] = [
+    Theme {
+        id: "nuit",
+        name: "Nuit",
+        dark: true,
+        background: Color32::from_rgb(16, 16, 19),
+        surface: Color32::from_rgb(30, 30, 35),
+        accent: Color32::from_rgb(240, 196, 92),
+        on_accent: Color32::from_rgb(28, 22, 8),
+        text: Color32::from_rgb(232, 232, 236),
+        muted: Color32::from_rgb(140, 140, 152),
+    },
+    Theme {
+        id: "encre",
+        name: "Encre bleue",
+        dark: true,
+        background: Color32::from_rgb(11, 16, 30),
+        surface: Color32::from_rgb(23, 32, 54),
+        accent: Color32::from_rgb(94, 200, 255),
+        on_accent: Color32::from_rgb(4, 20, 34),
+        text: Color32::from_rgb(226, 234, 246),
+        muted: Color32::from_rgb(126, 144, 172),
+    },
+    Theme {
+        id: "manga",
+        name: "Manga",
+        dark: true,
+        background: Color32::from_rgb(10, 10, 10),
+        surface: Color32::from_rgb(28, 28, 28),
+        accent: Color32::from_rgb(238, 66, 66),
+        on_accent: Color32::from_rgb(255, 255, 255),
+        text: Color32::from_rgb(242, 242, 242),
+        muted: Color32::from_rgb(150, 150, 150),
+    },
+    Theme {
+        id: "pop",
+        name: "Pop",
+        dark: true,
+        background: Color32::from_rgb(22, 13, 33),
+        surface: Color32::from_rgb(41, 26, 60),
+        accent: Color32::from_rgb(255, 98, 180),
+        on_accent: Color32::from_rgb(40, 6, 24),
+        text: Color32::from_rgb(242, 232, 252),
+        muted: Color32::from_rgb(166, 146, 190),
+    },
+    Theme {
+        id: "papier",
+        name: "Papier",
+        dark: false,
+        background: Color32::from_rgb(243, 238, 227),
+        surface: Color32::from_rgb(230, 223, 208),
+        accent: Color32::from_rgb(214, 74, 44),
+        on_accent: Color32::from_rgb(255, 255, 255),
+        text: Color32::from_rgb(34, 30, 26),
+        muted: Color32::from_rgb(112, 104, 94),
+    },
+];
+
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+
+/// Le thème en cours.
+pub fn theme() -> &'static Theme {
+    &THEMES[CURRENT.load(Ordering::Relaxed).min(THEMES.len() - 1)]
+}
+
+/// Passe au thème `id` (le premier s'il n'existe pas).
+pub fn set_theme(ctx: &egui::Context, id: &str) {
+    let index = THEMES.iter().position(|t| t.id == id).unwrap_or(0);
+    CURRENT.store(index, Ordering::Relaxed);
+    install(ctx);
+}
+
+/// Le style de toute l'appli, aux couleurs du thème : arrondi, aéré.
 pub fn install(ctx: &egui::Context) {
+    let t = theme();
     ctx.all_styles_mut(|style| {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = BACKGROUND;
-        visuals.window_fill = Color32::from_rgb(26, 26, 31);
-        visuals.window_stroke = Stroke::new(1.0, Color32::from_white_alpha(18));
+        let mut visuals = if t.dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        };
+        visuals.panel_fill = t.background;
+        visuals.window_fill = t.background.lerp_to_gamma(t.surface, 0.6);
+        visuals.window_stroke = Stroke::new(1.0, t.text.gamma_multiply(0.08));
         visuals.window_corner_radius = CornerRadius::same(12);
         visuals.menu_corner_radius = CornerRadius::same(10);
-        visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
-        visuals.selection.stroke = Stroke::new(1.0, ACCENT);
-        visuals.hyperlink_color = ACCENT;
+        visuals.selection.bg_fill = t.accent.gamma_multiply(0.35);
+        visuals.selection.stroke = Stroke::new(1.0, t.accent);
+        visuals.hyperlink_color = t.accent;
+        visuals.override_text_color = Some(t.text);
+        visuals.extreme_bg_color = t.surface;
         for w in [
             &mut visuals.widgets.noninteractive,
             &mut visuals.widgets.inactive,
@@ -37,9 +138,9 @@ pub fn install(ctx: &egui::Context) {
             w.corner_radius = CornerRadius::same(8);
             w.bg_stroke = Stroke::NONE;
         }
-        visuals.widgets.inactive.weak_bg_fill = SURFACE;
-        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(44, 44, 51);
-        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(54, 54, 62);
+        visuals.widgets.inactive.weak_bg_fill = t.surface;
+        visuals.widgets.hovered.weak_bg_fill = t.raised();
+        visuals.widgets.active.weak_bg_fill = t.surface.lerp_to_gamma(t.text, 0.14);
         visuals.widgets.hovered.expansion = 0.0;
         visuals.widgets.active.expansion = 0.0;
         style.visuals = visuals;
@@ -66,6 +167,7 @@ pub enum Icon {
     Plus,
     Folder,
     Search,
+    Download,
 }
 
 /// Dessine `icon` centrée sur `c`, dans un carré de côté `s`.
@@ -152,6 +254,14 @@ pub fn icon(painter: &egui::Painter, icon: Icon, c: Pos2, s: f32, color: Color32
             line(c - vec2(h * 0.6, 0.0), c + vec2(h * 0.6, 0.0));
             line(c - vec2(0.0, h * 0.6), c + vec2(0.0, h * 0.6));
         }
+        Icon::Download => {
+            let top = c - vec2(0.0, h * 0.75);
+            let tip = c + vec2(0.0, h * 0.35);
+            line(top, tip);
+            line(tip, tip + vec2(-h * 0.45, -h * 0.45));
+            line(tip, tip + vec2(h * 0.45, -h * 0.45));
+            line(c + vec2(-h * 0.7, h * 0.75), c + vec2(h * 0.7, h * 0.75));
+        }
         Icon::Search => {
             let r = h * 0.48;
             let lens = c - vec2(h * 0.15, h * 0.15);
@@ -208,35 +318,33 @@ pub fn button(ui: &mut Ui, glyph: Option<Icon>, text: &str, tone: Tone) -> Respo
     }
     // Fonds sombres et presque opaques : les boutons se posent aussi sur une
     // planche claire, et doivent s'y lire.
+    let t = theme();
     let (fill, color, stroke) = match tone {
         Tone::Primary => (
             if hovered {
-                ACCENT.gamma_multiply(1.08)
+                t.accent.gamma_multiply(1.08)
             } else {
-                ACCENT
+                t.accent
             },
-            ON_ACCENT,
+            t.on_accent,
             Stroke::NONE,
         ),
         Tone::Active => (
-            if hovered {
-                Color32::from_rgb(58, 50, 30)
-            } else {
-                Color32::from_rgb(44, 38, 24)
-            },
-            ACCENT,
-            Stroke::new(1.0, ACCENT.gamma_multiply(0.7)),
+            t.surface
+                .lerp_to_gamma(t.accent, if hovered { 0.3 } else { 0.2 }),
+            t.accent,
+            Stroke::new(1.0, t.accent.gamma_multiply(0.7)),
         ),
         Tone::Plain => (
             if pressed {
-                Color32::from_rgb(62, 62, 72)
+                t.surface.lerp_to_gamma(t.text, 0.18)
             } else if hovered {
-                Color32::from_rgb(50, 50, 58)
+                t.raised()
             } else {
-                Color32::from_rgba_unmultiplied(26, 26, 31, 235)
+                t.surface.gamma_multiply(0.94)
             },
-            TEXT,
-            Stroke::new(1.0, Color32::from_white_alpha(22)),
+            t.text,
+            Stroke::new(1.0, t.text.gamma_multiply(0.09)),
         ),
     };
     let painter = ui.painter();
@@ -274,6 +382,34 @@ pub fn shade(painter: &egui::Painter, rect: Rect, top: Color32, bottom: Color32)
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     painter.add(mesh);
+}
+
+/// Une trame de points, comme l'impression d'une BD : de plus en plus gros
+/// vers `corner`, jusqu'à `reach`.
+pub fn halftone(
+    painter: &egui::Painter,
+    rect: Rect,
+    corner: Pos2,
+    reach: f32,
+    step: f32,
+    color: Color32,
+) {
+    let mut y = rect.top();
+    let mut row = 0;
+    while y < rect.bottom() + step {
+        let shift = if row % 2 == 0 { 0.0 } else { step / 2.0 };
+        let mut x = rect.left() + shift;
+        while x < rect.right() + step {
+            let p = pos2(x, y);
+            let r = (1.0 - corner.distance(p) / reach) * step * 0.42;
+            if r > 0.5 {
+                painter.circle_filled(p, r, color);
+            }
+            x += step;
+        }
+        y += step;
+        row += 1;
+    }
 }
 
 /// Fond en dégradé horizontal, de `left` à `right`.
