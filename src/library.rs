@@ -2,19 +2,21 @@
 //! ajoutés, avec leur couverture. Les couvertures sont rendues en tâche de fond
 //! et gardées dans le cache, pour s'afficher tout de suite la fois suivante.
 //! Celles des tomes qui manquent sont téléchargées (BnF, Open Library).
+//! Les albums ajoutés sont copiés dans le dossier de Serj, rangés par série.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 
 use serj::pdf::Document;
 
 /// Hauteur des couvertures rendues, en pixels.
 const COVER_HEIGHT: f32 = 480.0;
-/// Profondeur maximale de recherche dans les dossiers ajoutés.
+/// Profondeur maximale de recherche dans un dossier ajouté.
 const MAX_DEPTH: usize = 4;
-/// Albums trouvés au plus dans les dossiers (un dossier de tout un disque ne bloque rien).
+/// Albums trouvés au plus dans un dossier (un dossier de tout un disque ne bloque rien).
 const MAX_FOUND: usize = 2000;
 
 pub enum Cover {
@@ -23,12 +25,29 @@ pub enum Cover {
     Failed,
 }
 
+/// Où en sont les copies vers le dossier de Serj.
+#[derive(Clone, Default)]
+pub struct Copying {
+    /// Albums qui restent à copier, celui en cours compris.
+    pub left: usize,
+    /// L'album en cours.
+    pub name: String,
+    /// Octets copiés, et à copier en tout, depuis que la file s'est remplie.
+    pub done: u64,
+    pub total: u64,
+}
+
 pub struct Library {
     pub covers: HashMap<PathBuf, Cover>,
     requests: Sender<PathBuf>,
     /// Les couvertures à télécharger : la clé, et les adresses à essayer.
     downloads: Sender<(PathBuf, Vec<String>)>,
     results: Receiver<(PathBuf, Option<egui::ColorImage>)>,
+    /// Les albums à copier : l'original et la copie voulue.
+    copies: Sender<(PathBuf, PathBuf)>,
+    /// Les copies faites : l'original et sa copie.
+    copied: Receiver<(PathBuf, PathBuf)>,
+    copying: Arc<Mutex<Copying>>,
 }
 
 impl Library {
@@ -36,6 +55,7 @@ impl Library {
         let (requests, inbox) = channel::<PathBuf>();
         let (outbox, results) = channel();
         let (outbox_web, repaint_web) = (outbox.clone(), repaint.clone());
+        let repaint_copies = repaint.clone();
         std::thread::Builder::new()
             .name("serj-couvertures".into())
             .spawn(move || {
@@ -62,12 +82,85 @@ impl Library {
                 }
             })
             .expect("thread des couvertures en ligne");
+        // À part aussi : copier un gros album ne retarde pas les couvertures.
+        let (copies, inbox) = channel::<(PathBuf, PathBuf)>();
+        let (outbox, copied) = channel();
+        let repaint = repaint_copies;
+        let copying = Arc::new(Mutex::new(Copying::default()));
+        let progress = copying.clone();
+        std::thread::Builder::new()
+            .name("serj-copies".into())
+            .spawn(move || {
+                for (from, to) in inbox {
+                    let size = std::fs::metadata(&from).map_or(0, |m| m.len());
+                    let start = {
+                        let mut p = progress.lock().unwrap();
+                        p.name = title(&from);
+                        p.done
+                    };
+                    let mut shown = std::time::Instant::now();
+                    let copied = copy(&from, &to, |n| {
+                        progress.lock().unwrap().done = start + n;
+                        if shown.elapsed().as_millis() > 100 {
+                            shown = std::time::Instant::now();
+                            repaint.request_repaint();
+                        }
+                    });
+                    {
+                        let mut p = progress.lock().unwrap();
+                        p.done = start + size;
+                        p.left = p.left.saturating_sub(1);
+                        if p.left == 0 {
+                            *p = Copying::default();
+                        }
+                    }
+                    if let Some(to) = copied {
+                        let _ = outbox.send((from, to));
+                    }
+                    repaint.request_repaint();
+                }
+            })
+            .expect("thread des copies");
         Self {
             covers: HashMap::new(),
             requests,
             downloads,
             results,
+            copies,
+            copied,
+            copying,
         }
+    }
+
+    /// Copie l'album `path` dans le dossier de Serj (sous `series` s'il en a
+    /// une), en tâche de fond ; rien s'il y est déjà.
+    pub fn import(&self, path: &Path, series: Option<&str>) {
+        let Some(dir) = books_dir() else { return };
+        let Some(name) = path.file_name() else { return };
+        if path.starts_with(&dir) {
+            return;
+        }
+        let dir = match series.and_then(serj::meta::file_safe) {
+            Some(series) => dir.join(series),
+            None => dir,
+        };
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
+        {
+            let mut p = self.copying.lock().unwrap();
+            p.left += 1;
+            p.total += size;
+        }
+        let _ = self.copies.send((path.to_path_buf(), dir.join(name)));
+    }
+
+    /// Où en sont les copies (`left` à zéro : aucune en cours).
+    pub fn copying(&self) -> Copying {
+        self.copying.lock().unwrap().clone()
+    }
+
+    /// Les copies finies depuis la dernière fois : l'original et sa copie.
+    pub fn copied(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.copied.try_iter().collect()
     }
 
     /// Range les couvertures arrivées.
@@ -106,6 +199,97 @@ impl Library {
         }
         &self.covers[key]
     }
+}
+
+/// Le dossier où Serj range ses copies des albums.
+pub fn books_dir() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "Serj")?;
+    Some(dirs.data_dir().join("books"))
+}
+
+/// Ouvre le dossier des albums de Serj dans le Finder (l'Explorateur…).
+pub fn open_books_dir() {
+    let Some(dir) = books_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(windows)]
+    let opener = "explorer";
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let opener = "xdg-open";
+    let _ = std::process::Command::new(opener).arg(dir).spawn();
+}
+
+/// Met l'album `path` à la corbeille, s'il est dans le dossier de Serj (jamais
+/// un original ailleurs), et retire le dossier de sa série s'il est vide.
+pub fn delete(path: &Path) {
+    let Some(books) = books_dir() else { return };
+    if !path.starts_with(&books) || trash::delete(path).is_err() {
+        return;
+    }
+    if let Some(dir) = path.parent()
+        && dir != books
+    {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+fn title(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Copie `from` vers `to` (ou `to (2)`… si un autre fichier porte ce nom) ;
+/// renvoie la copie. Un fichier de même nom et de même taille est pris pour
+/// une copie déjà faite. `progress` reçoit les octets copiés.
+fn copy(from: &Path, to: &Path, mut progress: impl FnMut(u64)) -> Option<PathBuf> {
+    let size = std::fs::metadata(from).ok()?.len();
+    let dir = to.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    let stem = to.file_stem()?.to_string_lossy().into_owned();
+    let extension = to
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 1.. {
+        let target = match n {
+            1 => to.to_path_buf(),
+            n => dir.join(format!("{stem} ({n}){extension}")),
+        };
+        match std::fs::metadata(&target) {
+            Ok(meta) if meta.len() == size => return Some(target),
+            Ok(_) => continue,
+            Err(_) => {}
+        }
+        // Copié à côté puis renommé : une copie interrompue ne passe pas pour un album.
+        let part = dir.join(format!(".{stem}{extension}.part"));
+        if copy_file(from, &part, &mut progress).is_err() {
+            let _ = std::fs::remove_file(&part);
+            return None;
+        }
+        std::fs::rename(&part, &target).ok()?;
+        return Some(target);
+    }
+    None
+}
+
+fn copy_file(from: &Path, to: &Path, progress: &mut impl FnMut(u64)) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let mut reader = std::fs::File::open(from)?;
+    let mut writer = std::fs::File::create(to)?;
+    let mut buffer = vec![0; 1 << 20];
+    let mut done = 0;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..n])?;
+        done += n as u64;
+        progress(done);
+    }
+    writer.sync_all()
 }
 
 /// Une image en ligne, depuis le cache sinon téléchargée.
@@ -153,8 +337,8 @@ fn download(agent: &ureq::Agent, url: &str) -> Option<egui::ColorImage> {
 }
 
 /// Les albums à montrer : les récents d'abord (dans leur ordre), puis ceux
-/// ajoutés et ceux des dossiers, par nom.
-pub fn books(recents: &[PathBuf], files: &[PathBuf], folders: &[PathBuf]) -> Vec<PathBuf> {
+/// ajoutés, par nom.
+pub fn books(recents: &[PathBuf], files: &[PathBuf]) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut books: Vec<PathBuf> = recents
         .iter()
@@ -162,9 +346,6 @@ pub fn books(recents: &[PathBuf], files: &[PathBuf], folders: &[PathBuf]) -> Vec
         .cloned()
         .collect();
     let mut found: Vec<PathBuf> = files.iter().filter(|p| p.exists()).cloned().collect();
-    for folder in folders {
-        scan(folder, 0, &mut found);
-    }
     found.sort_by_key(|p| {
         p.file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())
@@ -174,7 +355,8 @@ pub fn books(recents: &[PathBuf], files: &[PathBuf], folders: &[PathBuf]) -> Vec
     books
 }
 
-fn scan(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+/// Les PDF de `dir` et de ses sous-dossiers.
+pub fn scan(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
     if depth > MAX_DEPTH || found.len() >= MAX_FOUND {
         return;
     }
@@ -235,4 +417,28 @@ fn cover(path: &Path) -> Option<egui::ColorImage> {
         size,
         image.as_raw(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copie_sans_ecraser() {
+        let root = std::env::temp_dir().join(format!("serj-copie-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (a, b) = (root.join("a.pdf"), root.join("b.pdf"));
+        std::fs::write(&a, b"album a").unwrap();
+        std::fs::write(&b, b"album bb").unwrap();
+        let to = root.join("Série").join("Tome 1.pdf");
+        assert_eq!(copy(&a, &to, |_| {}), Some(to.clone()));
+        // Déjà copié : la même copie.
+        assert_eq!(copy(&a, &to, |_| {}), Some(to.clone()));
+        // Un autre album du même nom : à côté.
+        let other = root.join("Série").join("Tome 1 (2).pdf");
+        assert_eq!(copy(&b, &to, |_| {}), Some(other.clone()));
+        assert_eq!(std::fs::read(&other).unwrap(), b"album bb");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

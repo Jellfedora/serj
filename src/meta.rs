@@ -69,7 +69,6 @@ pub struct Info {
     pub year: Option<u32>,
     pub pages: Option<u32>,
     pub isbn: Option<String>,
-    pub summary: Option<String>,
     pub series_summary: Option<String>,
     pub genres: Vec<String>,
     /// Combien de tomes compte la série, quand on le sait (AniList).
@@ -82,9 +81,6 @@ pub struct Info {
     pub searched: bool,
     /// Pour un manga (AniList), ou une BD.
     pub manga: bool,
-    /// Le résumé n'a pas pu être cherché (service saturé) : à refaire après
-    /// cette date, en secondes depuis 1970.
-    pub retry_at: Option<u64>,
     /// La recherche qui a donné ces infos, pour savoir s'il faut la refaire.
     pub query: Guess,
     /// La version de la recherche ([`INFO_FORMAT`]) : une plus ancienne est
@@ -164,7 +160,12 @@ pub fn file_name(info: &Info) -> Option<String> {
         (_, _, Some(t)) => t.clone(),
         _ => return None,
     };
-    // Sans les caractères interdits dans un nom de fichier (macOS, Windows, Linux).
+    file_safe(&name)
+}
+
+/// `name` utilisable comme nom de fichier ou de dossier : sans les caractères
+/// interdits (macOS, Windows, Linux), ni points ou espaces au bout.
+pub fn file_safe(name: &str) -> Option<String> {
     let clean: String = name
         .chars()
         .map(|c| match c {
@@ -644,7 +645,7 @@ pub fn infobox_volumes(wikitext: &str) -> Option<u32> {
         .filter(|&n| n > 0)
 }
 
-/// Enlève les balises HTML d'un texte (résumés d'AniList ou de Google Books).
+/// Enlève les balises HTML d'un texte (résumés d'AniList).
 pub fn strip_html(s: &str) -> String {
     let s = s
         .replace("<br>", "\n")

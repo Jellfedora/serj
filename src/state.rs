@@ -83,7 +83,8 @@ pub struct State {
     pub positions: BTreeMap<String, Position>,
     /// Lecture page entière plutôt que case par case.
     pub whole_page: bool,
-    /// Dossiers dont les PDF sont montrés dans la bibliothèque de l'accueil.
+    /// Dossiers ajoutés avant que Serj copie les albums : leurs PDF sont
+    /// copiés au démarrage, puis la liste est vidée.
     pub folders: Vec<PathBuf>,
     /// PDF ajoutés un par un à la bibliothèque.
     pub files: Vec<PathBuf>,
@@ -147,20 +148,21 @@ impl State {
         self.recents.truncate(MAX_RECENTS);
     }
 
-    /// Ajoute des PDF et des dossiers à la bibliothèque.
+    /// Ajoute des PDF à la bibliothèque.
     pub fn add(&mut self, paths: Vec<PathBuf>) {
         for p in paths {
-            let list = if p.is_dir() {
-                &mut self.folders
-            } else if crate::app::is_pdf(&p) {
-                &mut self.files
-            } else {
-                continue;
-            };
-            if !list.contains(&p) {
-                list.push(p);
+            if !self.files.contains(&p) {
+                self.files.push(p);
             }
         }
+    }
+
+    /// Oublie tout de l'album `path` (supprimé).
+    pub fn forget(&mut self, path: &Path) {
+        self.recents.retain(|p| p != path);
+        self.files.retain(|p| p != path);
+        self.positions.remove(&key(path));
+        self.corrections.remove(&key(path));
     }
 
     pub fn position(&self, path: &Path) -> Position {
@@ -174,10 +176,15 @@ impl State {
     /// L'album `from` s'appelle maintenant `to` : sa place, sa correction et
     /// son rang dans les récents le suivent.
     pub fn renamed(&mut self, from: &Path, to: &Path) {
-        for p in self.recents.iter_mut().chain(&mut self.files) {
-            if p == from {
-                *p = to.to_path_buf();
+        for list in [&mut self.recents, &mut self.files] {
+            for p in list.iter_mut() {
+                if p == from {
+                    *p = to.to_path_buf();
+                }
             }
+            // `to` y était peut-être déjà (un album ajouté une seconde fois).
+            let mut seen = std::collections::HashSet::new();
+            list.retain(|p| seen.insert(p.clone()));
         }
         if let Some(pos) = self.positions.remove(&key(from)) {
             self.positions.insert(key(to), pos);

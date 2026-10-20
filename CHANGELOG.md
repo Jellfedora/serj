@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0]
+
+- Les BD ajoutées (« Ajouter des BD », glissées dans la fenêtre, ⌘ O) sont copiées dans le dossier de Serj, rangées par série (« Lanfeust de Troy/Lanfeust de Troy - Tome 2 - Thanos l'incongru.pdf ») ; les originaux ne sont pas touchés. La bibliothèque déjà là est copiée au premier lancement, et les PDF des dossiers ajoutés avant aussi (ces dossiers ne sont plus surveillés).
+- L'avancement des copies dans un bandeau de l'accueil : l'album en cours, la part copiée, ce qui reste.
+- « Dossier des BD », dans l'en-tête de l'accueil, ouvre ce dossier dans le Finder (l'Explorateur sous Windows).
+- « Supprimer l'album » (clic droit sur sa carte) met sa copie à la corbeille et l'oublie ; le dossier de la série, vide, est retiré.
+- Plus de résumé d'album (Google Books, dont le quota était toujours épuisé) : la fiche montre la présentation de la série, de Wikipédia.
+
 ## [0.4.0]
 
 - Marquer un album comme lu ou pas encore lu (clic droit sur sa carte, ou sa fiche), même sans l'avoir lu dans Serj ; « Tout marquer comme lu » sur la page d'une série.

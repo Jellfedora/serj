@@ -1,21 +1,19 @@
 //! Les infos des albums, cherchées en tâche de fond : le nom du fichier tout de
-//! suite, puis en ligne quand c'est possible (catalogue de la BnF, Google Books
-//! pour le résumé, Wikipédia pour la série, AniList pour les mangas). Gardées
+//! suite, puis en ligne quand c'est possible (catalogue de la BnF, Wikipédia
+//! pour la série, AniList pour les mangas). Gardées
 //! dans le cache : chaque album n'est cherché qu'une fois.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::Value;
 use serj::meta::{self, Author, Guess, Info, Record};
 
 /// Au plus une requête par service toutes les… (pour rester poli).
 const PAUSE: Duration = Duration::from_millis(350);
-/// Un résumé introuvable faute de quota est recherché de nouveau le lendemain.
-const RETRY_SECS: u64 = 24 * 3600;
 const USER_AGENT: &str = concat!(
     "Serj/",
     env!("CARGO_PKG_VERSION"),
@@ -175,12 +173,6 @@ pub fn file_guess(path: &Path) -> Guess {
     meta::guess(&stem)
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// Le fichier de cache des infos de `path`.
 fn cache_file(path: &Path) -> Option<PathBuf> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -239,7 +231,6 @@ impl Worker {
             && info.format >= meta::INFO_FORMAT
             && info.manga == job.manga
             && info.query == job.guess
-            && info.retry_at.is_none_or(|t| now() < t)
         {
             return info.clone();
         }
@@ -260,7 +251,6 @@ impl Worker {
         let mut reached = false;
 
         // Le catalogue de la BnF : titre exact, auteurs, éditeur, année, ISBN.
-        let mut isbns = Vec::new();
         match self.bnf(guess, manga) {
             Ok(found) => {
                 reached = true;
@@ -293,14 +283,13 @@ impl Worker {
                     info.year = f.year;
                     info.pages = f.pages;
                     info.isbn = f.isbns.first().cloned();
-                    isbns = f.isbns;
                     // La couverture : celle de la notice, sinon d'après l'ISBN.
                     if let Some(ark) = f.link.as_deref().and_then(|l| l.find("ark:").map(|i| &l[i..])) {
                         info.covers.push(format!(
                             "https://catalogue.bnf.fr/couverture?appName=NE&idArk={ark}&couverture=1"
                         ));
                     }
-                    for isbn in isbns.iter().take(2) {
+                    for isbn in f.isbns.iter().take(2) {
                         info.covers.push(format!(
                             "https://covers.openlibrary.org/b/isbn/{isbn}-M.jpg?default=false"
                         ));
@@ -311,24 +300,6 @@ impl Worker {
                 }
             }
             Err(Failure::Offline | Failure::Busy) => {}
-        }
-
-        // Le résumé de l'album : Google Books, par ISBN.
-        for isbn in isbns.iter().take(3) {
-            match self.google(isbn) {
-                Ok(Some((summary, link))) => {
-                    info.summary = Some(summary);
-                    info.sources.push(("Google Books".into(), link));
-                    break;
-                }
-                Ok(None) => reached = true,
-                Err(Failure::Busy) => {
-                    reached = true;
-                    info.retry_at = Some(now() + RETRY_SECS);
-                    break;
-                }
-                Err(Failure::Offline) => break,
-            }
         }
 
         // Pour un manga : AniList (résumé, genres, auteurs).
@@ -437,27 +408,6 @@ impl Worker {
             }
         }
         Ok(best)
-    }
-
-    /// Le résumé de l'album sur Google Books, et la page du livre.
-    fn google(&self, isbn: &str) -> Result<Option<(String, String)>, Failure> {
-        let body = self.get(
-            "https://www.googleapis.com/books/v1/volumes",
-            &[("q", &format!("isbn:{isbn}"))],
-        )?;
-        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-        let Some(item) = v["items"].get(0) else {
-            return Ok(None);
-        };
-        let summary = item["volumeInfo"]["description"]
-            .as_str()
-            .map(meta::strip_html)
-            .filter(|s| s.len() > 40);
-        let link = item["volumeInfo"]["infoLink"]
-            .as_str()
-            .unwrap_or("https://books.google.com")
-            .to_string();
-        Ok(summary.map(|s| (s, link)))
     }
 
     /// L'article Wikipédia de la série : son introduction, et le nombre de

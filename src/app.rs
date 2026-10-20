@@ -103,9 +103,11 @@ struct Actions {
 struct Clicks {
     open: Option<PathBuf>,
     add: bool,
+    open_folder: bool,
     about: bool,
-    remove_folder: Option<PathBuf>,
     forget: Option<PathBuf>,
+    /// Supprimer l'album : sa copie part à la corbeille.
+    delete: Option<PathBuf>,
     restart: Option<PathBuf>,
     manga: Option<PathBuf>,
     infos: Option<PathBuf>,
@@ -239,6 +241,11 @@ impl App {
                 .filter(|p| reopen && p.exists())
                 .cloned()
         });
+        // Les albums d'avant la copie dans le dossier de Serj, et les PDF des
+        // dossiers ajoutés alors : copiés eux aussi (rien pour ceux déjà copiés).
+        let mut older = library::books(&app.state.recents, &app.state.files);
+        older.append(&mut app.state.folders);
+        app.import(&older);
         if let Some(path) = path {
             app.open(&cc.egui_ctx, path);
         }
@@ -297,15 +304,35 @@ impl App {
             .extension()
             .map(|e| e.to_string_lossy().into_owned())
             .unwrap_or_else(|| "pdf".into());
-        let target = path.with_file_name(format!("{name}.{extension}"));
+        // Une copie de Serj se range aussi dans le dossier de sa série.
+        let dir = match library::books_dir().filter(|d| path.starts_with(d)) {
+            Some(books) => match info.series.as_deref().and_then(meta::file_safe) {
+                Some(series) => books.join(series),
+                None => books,
+            },
+            None => path.parent().map(Path::to_path_buf).unwrap_or_default(),
+        };
+        let target = dir.join(format!("{name}.{extension}"));
         // Déjà bien nommé, ou un autre fichier porte ce nom (macOS ignore la
         // casse : même nom autrement écrit compris).
         if target == path || target.exists() || !path.exists() {
             return;
         }
-        if std::fs::rename(path, &target).is_err() {
+        if std::fs::create_dir_all(&dir).is_err() || std::fs::rename(path, &target).is_err() {
             return;
         }
+        // Le dossier de la série devinée d'après le nom du fichier, s'il est vide.
+        if let Some(old) = path.parent()
+            && library::books_dir().is_some_and(|books| old != books && old.starts_with(&books))
+        {
+            let _ = std::fs::remove_dir(old);
+        }
+        self.moved(path, &target);
+    }
+
+    /// L'album `path` est maintenant `target` : tout ce qu'on en sait le suit.
+    fn moved(&mut self, path: &Path, target: &Path) {
+        let target = target.to_path_buf();
         self.state.renamed(path, &target);
         self.state.save();
         let query = self
@@ -346,12 +373,37 @@ impl App {
         self.info(path).full_title().unwrap_or_else(|| title(path))
     }
 
+    /// Ajoute des PDF et les PDF des dossiers à la bibliothèque, et les copie
+    /// dans le dossier de Serj : la copie remplace l'original une fois faite.
+    fn import(&mut self, paths: &[PathBuf]) {
+        let mut pdfs = Vec::new();
+        for p in paths {
+            if p.is_dir() {
+                library::scan(p, 0, &mut pdfs);
+            } else if is_pdf(p) {
+                pdfs.push(p.clone());
+            }
+        }
+        for pdf in &pdfs {
+            let guess = self
+                .state
+                .correction(pdf)
+                .cloned()
+                .unwrap_or_else(|| crate::infos::file_guess(pdf));
+            self.library.import(pdf, guess.series.as_deref());
+        }
+        self.state.add(pdfs);
+        self.state.save();
+        self.books_at = None;
+    }
+
     fn pick_file(&mut self, ctx: &egui::Context) {
         let mut dialog = rfd::FileDialog::new().add_filter("BD en PDF", &["pdf", "PDF"]);
         if let Some(dir) = self.state.recents.first().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.pick_file() {
+            self.import(std::slice::from_ref(&path));
             self.open(ctx, path);
         }
     }
@@ -368,9 +420,7 @@ impl App {
         #[cfg(not(target_os = "macos"))]
         let picked = dialog.pick_files();
         if let Some(paths) = picked {
-            self.state.add(paths);
-            self.state.save();
-            self.books_at = None;
+            self.import(&paths);
         }
     }
 
@@ -680,17 +730,25 @@ impl eframe::App for App {
         });
         match dropped.as_slice() {
             [] => {}
-            [one] if is_pdf(one) => self.open(&ctx, one.clone()),
-            _ => {
-                self.state.add(dropped);
-                self.state.save();
-                self.books_at = None;
+            [one] if is_pdf(one) => {
+                self.import(&dropped);
+                self.open(&ctx, one.clone());
             }
+            _ => self.import(&dropped),
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::O)) {
             self.pick_file(&ctx);
         }
 
+        for (from, to) in self.library.copied() {
+            if self.state.files.contains(&from) {
+                self.moved(&from, &to);
+                self.rename(&to);
+            } else if !self.state.files.contains(&to) {
+                // Supprimé pendant la copie.
+                library::delete(&to);
+            }
+        }
         for path in self.infos.receive() {
             self.rename(&path);
         }
@@ -730,7 +788,7 @@ impl App {
         self.library.receive(ctx);
         // Les dossiers relus de temps en temps : un album ajouté y apparaît seul.
         if self.books_at.is_none_or(|at| now - at > 5.0) {
-            self.books = library::books(&self.state.recents, &self.state.files, &self.state.folders);
+            self.books = library::books(&self.state.recents, &self.state.files);
             self.books_at = Some(now);
         }
         // Le nom du fichier tout de suite, ce qu'on trouve en ligne ensuite.
@@ -838,6 +896,16 @@ impl App {
                                         "Des PDF ou des dossiers entiers ; ou glisse-les dans la fenêtre",
                                     )
                                     .clicked();
+                                    clicks.open_folder |= widgets::button(
+                                        ui,
+                                        Some(Icon::Folder),
+                                        label("Dossier des BD"),
+                                        Tone::Plain,
+                                    )
+                                    .on_hover_text(
+                                        "Ouvrir le dossier où Serj copie les BD ajoutées, rangées par série",
+                                    )
+                                    .clicked();
                                     clicks.about |= widgets::button(
                                         ui,
                                         None,
@@ -869,6 +937,7 @@ impl App {
                     }
 
                     self.update_banner(ui, ctx);
+                    self.copy_banner(ui);
 
                     let browsing = self.search.is_empty() && self.open_series.is_none();
                     if browsing && let Some(path) = &featured {
@@ -878,14 +947,6 @@ impl App {
                     if !books.is_empty() && !inline_search {
                         ui.add_space(30.0);
                         self.search_box(ui);
-                    }
-                    if !self.state.folders.is_empty() {
-                        ui.add_space(if browsing && featured.is_some() {
-                            36.0
-                        } else {
-                            20.0
-                        });
-                        self.folder_chips(ui, &mut clicks);
                     }
 
                     if books.is_empty() {
@@ -960,14 +1021,17 @@ impl App {
         if clicks.add {
             self.add_books();
         }
-        if let Some(folder) = clicks.remove_folder {
-            self.state.folders.retain(|f| *f != folder);
-            self.state.save();
-            self.books_at = None;
+        if clicks.open_folder {
+            library::open_books_dir();
         }
         if let Some(path) = clicks.forget {
             self.state.recents.retain(|p| *p != path);
-            self.state.files.retain(|p| *p != path);
+            self.state.save();
+            self.books_at = None;
+        }
+        if let Some(path) = clicks.delete {
+            library::delete(&path);
+            self.state.forget(&path);
             self.state.save();
             self.books_at = None;
         }
@@ -1083,50 +1147,71 @@ impl App {
             });
     }
 
-    /// Les dossiers de la bibliothèque, en pastilles qu'on peut retirer.
-    fn folder_chips(&self, ui: &mut egui::Ui, clicks: &mut Clicks) {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-            let (r, _) = ui.allocate_exact_size(vec2(18.0, 22.0), Sense::hover());
-            widgets::icon(ui.painter(), Icon::Folder, r.center(), 14.0, theme().muted);
-            ui.label(
-                egui::RichText::new("Dossiers")
-                    .size(12.5)
-                    .color(theme().muted),
-            );
-            ui.add_space(4.0);
-            for folder in &self.state.folders {
-                let name = folder
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| folder.display().to_string());
-                egui::Frame::new()
-                    .fill(theme().surface)
-                    .corner_radius(14)
-                    .inner_margin(egui::Margin {
-                        left: 12,
-                        right: 4,
-                        top: 3,
-                        bottom: 3,
-                    })
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.label(egui::RichText::new(name).size(12.5).color(theme().text))
-                            .on_hover_text(folder.display().to_string());
-                        let remove = ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("×").size(14.0).color(theme().muted),
-                                )
-                                .frame(false),
+    /// Les albums en train d'être copiés dans le dossier de Serj.
+    fn copy_banner(&self, ui: &mut egui::Ui) {
+        let copying = self.library.copying();
+        if copying.left == 0 {
+            return;
+        }
+        let part = if copying.total > 0 {
+            (copying.done as f32 / copying.total as f32).min(1.0)
+        } else {
+            0.0
+        };
+        let title = if copying.left == 1 {
+            format!("Copie de « {} »", copying.name)
+        } else {
+            format!("Copie de {} albums dans le dossier de Serj", copying.left)
+        };
+        let detail = if copying.left == 1 {
+            format!("{} % · {}", (part * 100.0) as u32, size(copying.total))
+        } else {
+            format!(
+                "{} % · {} sur {} · en cours : {}",
+                (part * 100.0) as u32,
+                size(copying.done),
+                size(copying.total),
+                copying.name
+            )
+        };
+        ui.add_space(24.0);
+        let t = theme();
+        egui::Frame::new()
+            .fill(t.surface)
+            .corner_radius(16)
+            .inner_margin(egui::Margin::symmetric(18, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 18.0, t.accent);
+                    widgets::icon(ui.painter(), Icon::Folder, r.center(), 18.0, t.on_accent);
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(title).size(15.5).strong().color(t.text),
                             )
-                            .on_hover_text("Retirer ce dossier de la bibliothèque");
-                        if remove.clicked() {
-                            clicks.remove_folder = Some(folder.clone());
-                        }
+                            .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(detail).size(12.5).color(t.muted),
+                            )
+                            .truncate(),
+                        );
                     });
-            }
-        });
+                });
+                ui.add_space(10.0);
+                let (bar, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
+                ui.painter().rect_filled(bar, 2.0, t.raised());
+                let mut done = bar;
+                done.set_width(bar.width() * part);
+                ui.painter().rect_filled(done, 2.0, t.accent);
+            });
+        // Le fil des copies redemande un affichage ; au cas où, pas plus tard que ça.
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
 
     /// Une nouvelle version : de quoi l'installer, puis redémarrer.
@@ -1782,12 +1867,6 @@ impl App {
             if !credits.is_empty() {
                 ui.label(credits);
             }
-            if let Some(summary) = &info.summary {
-                ui.add_space(4.0);
-                let short: String = summary.chars().take(420).collect();
-                let more = if short.len() < summary.len() { "…" } else { "" };
-                ui.label(egui::RichText::new(format!("{short}{more}")).color(theme().muted));
-            }
             if let Some((name, _)) = info.sources.first() {
                 ui.add_space(4.0);
                 ui.label(
@@ -1858,12 +1937,15 @@ impl App {
                         if pos.in_progress() && ui.button("Recommencer au début").clicked() {
                             clicks.restart = Some(path.clone());
                         }
-                        let forget = if added {
-                            "Retirer de la bibliothèque"
-                        } else {
-                            "Retirer des récents"
-                        };
-                        if (added || recent) && ui.button(forget).clicked() {
+                        if added {
+                            if ui
+                                .button("Supprimer l'album")
+                                .on_hover_text("Sa copie dans le dossier de Serj va à la corbeille")
+                                .clicked()
+                            {
+                                clicks.delete = Some(path.clone());
+                            }
+                        } else if recent && ui.button("Retirer des récents").clicked() {
                             clicks.forget = Some(path.clone());
                         }
                     });
@@ -2226,17 +2308,10 @@ impl App {
                     egui::ScrollArea::vertical()
                         .max_height((ctx.content_rect().height() - 420.0).max(160.0))
                         .show(ui, |ui| {
-                            let none = if info.retry_at.is_some() {
-                                "Pas encore de résumé : le service était saturé, nouvel essai demain."
-                            } else if pending {
-                                "…"
-                            } else {
-                                "Pas de résumé trouvé pour cet album."
-                            };
-                            prose(ui, "Résumé", info.summary.as_deref().unwrap_or(none));
-                            if let Some(text) = &info.series_summary {
-                                ui.add_space(14.0);
-                                prose(ui, "La série", text);
+                            match (&info.series_summary, pending) {
+                                (Some(text), _) => prose(ui, "La série", text),
+                                (None, true) => prose(ui, "La série", "…"),
+                                (None, false) => {}
                             }
                         });
                     if !info.sources.is_empty() {
@@ -3156,6 +3231,16 @@ fn title(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Album".into())
+}
+
+/// « 340 Mo », « 1,2 Go ».
+fn size(bytes: u64) -> String {
+    let mb = bytes as f64 / 1_000_000.0;
+    if mb < 1000.0 {
+        format!("{} Mo", mb.round() as u64)
+    } else {
+        format!("{:.1} Go", mb / 1000.0).replace('.', ",")
+    }
 }
 
 fn percent(progress: f32) -> String {
