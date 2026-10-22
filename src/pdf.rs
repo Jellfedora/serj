@@ -2,6 +2,9 @@
 
 use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
+use hayro::hayro_syntax::content::ops::TypedInstruction;
+use hayro::hayro_syntax::object::Object;
+use hayro::hayro_syntax::page::Page;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{PixmapSettings, RenderCache, RenderSettings, render};
 
@@ -24,6 +27,30 @@ impl Document {
 
     pub fn page_count(&self) -> usize {
         self.pdf.pages().len()
+    }
+
+    /// Un livre plutôt qu'une BD : la plupart des pages, prises çà et là dans
+    /// le document, portent surtout du texte (beaucoup de caractères, ou du
+    /// texte sans image).
+    pub fn mostly_text(&self) -> bool {
+        let pages = self.pdf.pages();
+        let count = pages.len();
+        if count == 0 {
+            return false;
+        }
+        let samples: Vec<usize> = if count <= 10 {
+            (0..count).collect()
+        } else {
+            (1..=10).map(|k| count * k / 11).collect()
+        };
+        let text_pages = samples
+            .iter()
+            .filter(|&&i| {
+                let (chars, images) = page_contents(&pages[i]);
+                chars >= 500 || (chars >= 150 && images == 0)
+            })
+            .count();
+        text_pages * 2 > samples.len()
     }
 
     /// Rend la page `index` pour qu'elle fasse environ `target_height` pixels de haut.
@@ -51,4 +78,27 @@ impl Document {
             rgba: pixmap.data_as_u8_slice().to_vec(),
         })
     }
+}
+
+/// Combien la page affiche de caractères (octets de texte), et d'objets
+/// dessinés d'un coup (des images, le plus souvent).
+fn page_contents(page: &Page) -> (usize, usize) {
+    let (mut chars, mut images) = (0, 0);
+    let mut ops = page.typed_operations();
+    while let Some(op) = ops.next() {
+        match op {
+            TypedInstruction::ShowText(t) => chars += t.0.as_bytes().len(),
+            TypedInstruction::NextLineAndShowText(t) => chars += t.0.as_bytes().len(),
+            TypedInstruction::ShowTexts(t) => {
+                for item in t.0.iter::<Object>() {
+                    if let Object::String(s) = item {
+                        chars += s.as_bytes().len();
+                    }
+                }
+            }
+            TypedInstruction::XObject(_) => images += 1,
+            _ => {}
+        }
+    }
+    (chars, images)
 }

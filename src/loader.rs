@@ -1,12 +1,13 @@
-//! Chargeur en tâche de fond : ouvre le PDF, rend les pages demandées et y
-//! détecte les cases, pour que la lecture ne saccade jamais.
+//! Chargeur en tâche de fond : ouvre l'album (PDF, CBZ, CBR), rend les pages
+//! demandées et y détecte les cases, pour que la lecture ne saccade jamais.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use serj::document::Document;
 use serj::panels::{self, Rect};
-use serj::pdf::{Document, PageImage};
+use serj::pdf::PageImage;
 
 /// Hauteur de rendu des pages, en pixels : assez pour qu'une petite case reste
 /// nette une fois agrandie à la taille de l'écran.
@@ -41,12 +42,13 @@ pub struct Loader {
 }
 
 impl Loader {
-    pub fn open(path: PathBuf, right_to_left: bool, repaint: egui::Context) -> Self {
+    /// `panels` : chercher les cases (pas pour un livre, lu page par page).
+    pub fn open(path: PathBuf, right_to_left: bool, panels: bool, repaint: egui::Context) -> Self {
         let (requests, inbox) = channel();
         let (outbox, events) = channel();
         std::thread::Builder::new()
             .name("serj-loader".into())
-            .spawn(move || run(path, right_to_left, inbox, outbox, repaint))
+            .spawn(move || run(path, right_to_left, panels, inbox, outbox, repaint))
             .expect("thread du chargeur");
         Self { requests, events }
     }
@@ -67,6 +69,7 @@ impl Loader {
 fn run(
     path: PathBuf,
     mut rtl: bool,
+    panels: bool,
     inbox: Receiver<Request>,
     outbox: Sender<Event>,
     repaint: egui::Context,
@@ -75,10 +78,7 @@ fn run(
         let _ = outbox.send(event);
         repaint.request_repaint();
     };
-    let doc = match std::fs::read(&path)
-        .map_err(|e| format!("Impossible de lire le fichier ({e})"))
-        .and_then(Document::open)
-    {
+    let doc = match Document::open(&path) {
         Ok(doc) => doc,
         Err(e) => return send(Event::Failed(e)),
     };
@@ -118,7 +118,11 @@ fn run(
         let Some(image) = doc.render(index, RENDER_HEIGHT) else {
             continue;
         };
-        let mut found = panels::detect(image.width, image.height, &image.rgba, rtl);
+        let mut found = if panels {
+            panels::detect(image.width, image.height, &image.rgba, rtl)
+        } else {
+            Vec::new()
+        };
         if found.is_empty() {
             // Page blanche ou presque : on la montre entière.
             found.push(Rect {

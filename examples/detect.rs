@@ -1,11 +1,12 @@
-//! Débogage : rend des pages d'un PDF et y dessine les cases détectées.
-//! cargo run --release --example detect -- fichier.pdf dossier_sortie [première] [dernière]
+//! Débogage : rend des pages d'un album (PDF, CBZ, CBR) et y dessine les
+//! cases détectées.
+//! cargo run --release --example detect -- album.pdf dossier_sortie [première] [dernière]
 
-use serj::{panels, pdf::Document};
+use serj::{document::Document, panels};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let doc = Document::open(std::fs::read(&args[1]).unwrap()).unwrap();
+    let doc = Document::open(std::path::Path::new(&args[1])).unwrap();
     let out = std::path::Path::new(&args[2]);
     std::fs::create_dir_all(out).unwrap();
     let first: usize = args.get(3).map_or(0, |s| s.parse().unwrap());

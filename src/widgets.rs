@@ -109,6 +109,63 @@ pub fn set_theme(ctx: &egui::Context, id: &str) {
     install(ctx);
 }
 
+/// Les polices des livres : PT Serif et PT Sans (ParaType, licence OFL), en
+/// romain, italique, gras et gras italique. Chaque famille se replie sur les
+/// polices d'egui pour les caractères qu'elle n'a pas.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let fallback = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    for (name, bytes) in [
+        (
+            "serif",
+            &include_bytes!("../assets/fonts/PT_Serif-Web-Regular.ttf")[..],
+        ),
+        (
+            "serif-italic",
+            &include_bytes!("../assets/fonts/PT_Serif-Web-Italic.ttf")[..],
+        ),
+        (
+            "serif-bold",
+            &include_bytes!("../assets/fonts/PT_Serif-Web-Bold.ttf")[..],
+        ),
+        (
+            "serif-bold-italic",
+            &include_bytes!("../assets/fonts/PT_Serif-Web-BoldItalic.ttf")[..],
+        ),
+        (
+            "sans",
+            &include_bytes!("../assets/fonts/PT_Sans-Web-Regular.ttf")[..],
+        ),
+        (
+            "sans-italic",
+            &include_bytes!("../assets/fonts/PT_Sans-Web-Italic.ttf")[..],
+        ),
+        (
+            "sans-bold",
+            &include_bytes!("../assets/fonts/PT_Sans-Web-Bold.ttf")[..],
+        ),
+        (
+            "sans-bold-italic",
+            &include_bytes!("../assets/fonts/PT_Sans-Web-BoldItalic.ttf")[..],
+        ),
+    ] {
+        fonts.font_data.insert(
+            name.into(),
+            std::sync::Arc::new(egui::FontData::from_static(bytes)),
+        );
+        let mut family = vec![name.to_string()];
+        family.extend(fallback.iter().cloned());
+        fonts
+            .families
+            .insert(egui::FontFamily::Name(name.into()), family);
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// Le style de toute l'appli, aux couleurs du thème : arrondi, aéré.
 pub fn install(ctx: &egui::Context) {
     let t = theme();
@@ -168,6 +225,12 @@ pub enum Icon {
     Folder,
     Search,
     Download,
+    /// Le sommaire d'un livre : des lignes.
+    Contents,
+    /// Les réglages : une roue dentée.
+    Gear,
+    /// Envoyer (vers la Kindle) : un avion en papier.
+    Send,
 }
 
 /// Dessine `icon` centrée sur `c`, dans un carré de côté `s`.
@@ -268,6 +331,33 @@ pub fn icon(painter: &egui::Painter, icon: Icon, c: Pos2, s: f32, color: Color32
             painter.circle_stroke(lens, r, stroke);
             let d = std::f32::consts::FRAC_1_SQRT_2;
             line(lens + vec2(r * d, r * d), c + vec2(h * 0.75, h * 0.75));
+        }
+        Icon::Gear => {
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::TAU / 8.0;
+                let dir = vec2(a.cos(), a.sin());
+                line(c + dir * h * 0.5, c + dir * h * 0.85);
+            }
+            painter.circle_stroke(c, h * 0.55, stroke);
+            painter.circle_filled(c, h * 0.2, color);
+        }
+        Icon::Send => {
+            let tip = c + vec2(h * 0.8, -h * 0.55);
+            let tail = c + vec2(-h * 0.8, -h * 0.05);
+            let fold = c + vec2(-h * 0.1, h * 0.15);
+            let bottom = c + vec2(h * 0.05, h * 0.8);
+            line(tail, tip);
+            line(tip, bottom);
+            line(bottom, fold);
+            line(fold, tail);
+            line(fold, tip);
+        }
+        Icon::Contents => {
+            for k in [-1.0, 0.0, 1.0] {
+                let y = c.y + k * h * 0.5;
+                painter.circle_filled(pos2(c.x - h * 0.65, y), s / 14.0, color);
+                line(pos2(c.x - h * 0.35, y), pos2(c.x + h * 0.75, y));
+            }
         }
         Icon::Folder => {
             let body = Rect::from_center_size(c + vec2(0.0, h * 0.1), vec2(s * 0.8, s * 0.56));

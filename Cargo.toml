@@ -2,17 +2,22 @@
 name = "serj"
 version = "0.5.0"
 edition = "2024"
-description = "Lecteur de BD en PDF. Une case à la fois."
+description = "Lecteur de BD, mangas et livres. Une case à la fois."
 repository = "https://github.com/Jellfedora/serj"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 directories = "6"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "links", "wayland", "x11"] }
 egui = "0.36"
+encoding_rs = "0.8"
 flate2 = "1"
 hayro = "0.8"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "hostname", "rustls-tls"] }
+mobi = "0.8"
+quick-xml = { version = "0.41", features = ["escape-html"] }
 regex = "1"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -21,14 +26,26 @@ sha2 = "0.11"
 tar = "0.4"
 trash = "5"
 unicode-normalization = "0.1"
+unrar = "0.5"
 ureq = { version = "3", features = ["json"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = "thin"
 strip = true
 
-[target."cfg(windows)".dependencies]
-zip = { version = "8", default-features = false, features = ["deflate"] }
-
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 self-replace = "1"
+
+# Le mot de passe d'envoi vers la Kindle, dans le trousseau du système.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "eframe"] }

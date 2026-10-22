@@ -1,7 +1,7 @@
-//! Les infos des albums, cherchées en tâche de fond : le nom du fichier tout de
-//! suite, puis en ligne quand c'est possible (catalogue de la BnF, Wikipédia
-//! pour la série, AniList pour les mangas). Gardées
-//! dans le cache : chaque album n'est cherché qu'une fois.
+//! Les infos des albums, cherchées en tâche de fond : le nom du fichier (ou ce
+//! qu'un livre en texte dit de lui-même) tout de suite, puis en ligne quand
+//! c'est possible (catalogue de la BnF, Wikipédia pour la série, AniList pour
+//! les mangas). Gardées dans le cache : chaque album n'est cherché qu'une fois.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -24,6 +24,7 @@ struct Job {
     path: PathBuf,
     guess: Guess,
     manga: bool,
+    livre: bool,
     /// La recherche part d'infos corrigées à la main : elles priment sur
     /// celles du catalogue.
     corrected: bool,
@@ -97,25 +98,36 @@ impl Infos {
     }
 
     /// Les infos de `path` : tout de suite ce que dit le nom du fichier (ou la
-    /// correction), puis ce qu'on trouve en ligne. `manga` et `correction`
-    /// changés : on cherche de nouveau.
-    pub fn get(&mut self, path: &Path, manga: bool, correction: Option<&Guess>) -> &Info {
+    /// correction), puis ce qu'on trouve en ligne. `manga`, `livre` et
+    /// `correction` changés : on cherche de nouveau.
+    pub fn get(
+        &mut self,
+        path: &Path,
+        manga: bool,
+        livre: bool,
+        correction: Option<&Guess>,
+    ) -> &Info {
         let guess = correction.cloned().unwrap_or_else(|| file_guess(path));
         let stale = self
             .map
             .get(path)
-            .is_none_or(|i| i.manga != manga || i.query != guess);
+            .is_none_or(|i| i.manga != manga || i.livre != livre || i.query != guess);
         if stale {
             let force = self.map.contains_key(path);
             let mut info = Info::from_guess(&guess);
             info.manga = manga;
+            info.livre = livre;
+            info.summary = embedded(path).and_then(|m| m.description);
             self.map.insert(path.to_path_buf(), info);
             self.pending.insert(path.to_path_buf());
             let _ = self.requests.send(Job {
                 path: path.to_path_buf(),
                 guess,
                 manga,
-                corrected: correction.is_some(),
+                livre,
+                // Un livre qui dit son titre et ses auteurs : comme corrigé à la main.
+                corrected: correction.is_some()
+                    || embedded(path).is_some_and(|m| m.title.is_some()),
                 force,
             });
         }
@@ -124,26 +136,33 @@ impl Infos {
 
     /// Les infos du tome `volume` de la série `series`, que la bibliothèque n'a
     /// pas : cherchées comme celles d'un album, sous une clé à part.
-    pub fn volume(&mut self, series: &str, volume: u32, manga: bool) -> (PathBuf, &Info) {
+    pub fn volume(
+        &mut self,
+        series: &str,
+        volume: u32,
+        manga: bool,
+        livre: bool,
+    ) -> (PathBuf, &Info) {
         let key = volume_key(series, volume);
         let guess = Guess {
             series: Some(series.to_string()),
             volume: Some(volume),
             ..Guess::default()
         };
-        self.get(&key, manga, Some(&guess));
+        self.get(&key, manga, livre, Some(&guess));
         (key.clone(), &self.map[&key])
     }
 
     /// Cherche de nouveau en ligne, sans le cache.
-    pub fn refresh(&mut self, path: &Path, manga: bool, correction: Option<&Guess>) {
+    pub fn refresh(&mut self, path: &Path, manga: bool, livre: bool, correction: Option<&Guess>) {
         let guess = correction.cloned().unwrap_or_else(|| file_guess(path));
         self.pending.insert(path.to_path_buf());
         let _ = self.requests.send(Job {
             path: path.to_path_buf(),
             guess,
             manga,
-            corrected: correction.is_some(),
+            livre,
+            corrected: correction.is_some() || embedded(path).is_some_and(|m| m.title.is_some()),
             force: true,
         });
     }
@@ -156,7 +175,10 @@ impl Infos {
 
 /// Cherche les infos de `path` tout de suite, sans le cache (`serj --infos`).
 pub fn lookup_now(path: &Path, manga: bool) -> Info {
-    Worker::new().lookup(&file_guess(path), manga, false)
+    let livre = serj::ebook::is_ebook(path);
+    let mut info = Worker::new().lookup(&file_guess(path), manga, livre, livre);
+    info.summary = embedded(path).and_then(|m| m.description);
+    info
 }
 
 /// La clé d'un tome qu'on n'a pas (aucun fichier ne porte ce nom).
@@ -164,13 +186,43 @@ pub fn volume_key(series: &str, volume: u32) -> PathBuf {
     PathBuf::from(format!("serj-tome-manquant:{}:{volume}", meta::normalize(series)))
 }
 
-/// Ce que dit le nom du fichier.
+/// Ce que dit le nom du fichier ; pour un livre en texte, ce qu'il dit de
+/// lui-même (titre, auteurs, série), le nom du fichier sinon.
 pub fn file_guess(path: &Path) -> Guess {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    meta::guess(&stem)
+    let from_name = meta::guess(&stem);
+    match embedded(path) {
+        Some(m) if m.title.is_some() => Guess {
+            series: m.series,
+            volume: m.series_index,
+            title: m.title,
+            authors: if m.authors.is_empty() {
+                from_name.authors
+            } else {
+                m.authors
+            },
+        },
+        _ => from_name,
+    }
+}
+
+/// Les infos qu'un livre en texte porte en lui, lues une fois par fichier.
+pub fn embedded(path: &Path) -> Option<serj::ebook::Metadata> {
+    static CACHE: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<PathBuf, Option<serj::ebook::Metadata>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    if !serj::ebook::is_ebook(path) {
+        return None;
+    }
+    if let Some(known) = CACHE.lock().ok()?.get(path) {
+        return known.clone();
+    }
+    let found = serj::ebook::metadata(path).map(|(m, _)| m);
+    CACHE.lock().ok()?.insert(path.to_path_buf(), found.clone());
+    found
 }
 
 /// Le fichier de cache des infos de `path`.
@@ -230,11 +282,18 @@ impl Worker {
             && info.searched
             && info.format >= meta::INFO_FORMAT
             && info.manga == job.manga
+            && info.livre == job.livre
             && info.query == job.guess
         {
             return info.clone();
         }
-        let info = self.lookup(&job.guess, job.manga, job.corrected);
+        let mut info = self.lookup(&job.guess, job.manga, job.livre, job.corrected);
+        // Ce que le livre dit de lui-même complète le catalogue.
+        if let Some(m) = embedded(&job.path) {
+            info.summary = m.description;
+            info.publisher = info.publisher.or(m.publisher);
+            info.year = info.year.or(m.year);
+        }
         if info.searched {
             save(&job.path, &info);
         }
@@ -245,13 +304,14 @@ impl Worker {
         }
     }
 
-    fn lookup(&mut self, guess: &Guess, manga: bool, corrected: bool) -> Info {
+    fn lookup(&mut self, guess: &Guess, manga: bool, livre: bool, corrected: bool) -> Info {
         let mut info = Info::from_guess(guess);
         info.manga = manga;
+        info.livre = livre;
         let mut reached = false;
 
         // Le catalogue de la BnF : titre exact, auteurs, éditeur, année, ISBN.
-        match self.bnf(guess, manga) {
+        match self.bnf(guess, manga, livre) {
             Ok(found) => {
                 reached = true;
                 if let Some(f) = found {
@@ -303,7 +363,10 @@ impl Worker {
         }
 
         // Pour un manga : AniList (résumé, genres, auteurs).
-        if manga && let Ok(found) = self.anilist(guess) {
+        if manga
+            && !livre
+            && let Ok(found) = self.anilist(guess)
+        {
             reached = true;
             if let Some(a) = found {
                 info.series_summary = a.summary;
@@ -320,9 +383,15 @@ impl Worker {
             }
         }
 
-        // La série présentée par Wikipédia, et combien elle compte de tomes.
+        // La série présentée par Wikipédia, et combien elle compte de tomes
+        // (pour un livre : sa série seulement, ou le livre lui-même).
         if let Some(name) = info.series.clone().or_else(|| info.title.clone()) {
-            match self.wikipedia(&name, manga) {
+            let kind = match (livre, manga) {
+                (true, _) => "roman",
+                (false, true) => "manga",
+                (false, false) => "bande dessinée",
+            };
+            match self.wikipedia(&name, kind) {
                 Ok(Some(article)) => {
                     reached = true;
                     if let Some(extract) = article.extract {
@@ -358,7 +427,7 @@ impl Worker {
     }
 
     /// Les notices de la BnF, de plus en plus larges jusqu'à trouver l'album.
-    fn bnf(&self, g: &Guess, manga: bool) -> Result<Option<meta::Found>, Failure> {
+    fn bnf(&self, g: &Guess, manga: bool, livre: bool) -> Result<Option<meta::Found>, Failure> {
         let clean = |s: &str| s.replace('"', " ");
         let author = g
             .authors
@@ -398,7 +467,7 @@ impl Worker {
                 ],
             )?;
             records.extend(meta::parse_bnf(&xml));
-            best = meta::best_bnf(&records, g, manga);
+            best = meta::best_bnf(&records, g, manga, livre);
             // Titre et numéro retrouvés : inutile d'élargir.
             if best
                 .as_ref()
@@ -412,13 +481,12 @@ impl Worker {
 
     /// L'article Wikipédia de la série : son introduction, et le nombre de
     /// tomes que donne son infobox.
-    fn wikipedia(&mut self, name: &str, manga: bool) -> Result<Option<Article>, Failure> {
+    fn wikipedia(&mut self, name: &str, kind: &str) -> Result<Option<Article>, Failure> {
         let key = meta::normalize(name);
-        if let Some(found) = self.series.get(&key) {
+        if let Some(found) = self.series.get(&format!("{kind}:{key}")) {
             return Ok(found.clone());
         }
         let api = "https://fr.wikipedia.org/w/api.php";
-        let kind = if manga { "manga" } else { "bande dessinée" };
         let body = self.get(
             api,
             &[
@@ -432,13 +500,30 @@ impl Worker {
         let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         // Un article dont le titre est la série (« Lanfeust de Troy »,
         // « Naruto (manga) »), pas une page qui la cite.
+        // Pas l'adaptation : « Harry Potter (série télévisée) », « (film) »…
+        let other_medium = |t: &str| {
+            let qualifier = meta::normalize(t.split_once(" (").map_or("", |(_, q)| q));
+            [
+                "film",
+                "serie televisee",
+                "telefilm",
+                "jeu video",
+                "serie danimation",
+                "dessin anime",
+                "chanson",
+                "comedie musicale",
+                "piece de theatre",
+            ]
+            .iter()
+            .any(|w| qualifier.contains(w))
+        };
         let page = v["query"]["search"].as_array().and_then(|results| {
             results
                 .iter()
                 .filter_map(|r| r["title"].as_str())
                 .find(|t| {
-                    let t = meta::normalize(t.split(" (").next().unwrap_or(t));
-                    t == key
+                    let base = meta::normalize(t.split(" (").next().unwrap_or(t));
+                    base == key && !other_medium(t)
                 })
         });
         let found = match page {
@@ -466,7 +551,7 @@ impl Worker {
                         .as_str()
                         .map(str::trim)
                         .filter(|e| e.len() > 40)
-                        .map(|e| shorten(e, 1400));
+                        .map(|e| shorten(&meta::without_pronunciation(e), 1400));
                     let volumes = p["revisions"][0]["slots"]["main"]["*"]
                         .as_str()
                         .and_then(meta::infobox_volumes);
@@ -479,7 +564,7 @@ impl Worker {
             }
             None => None,
         };
-        self.series.insert(key, found.clone());
+        self.series.insert(format!("{kind}:{key}"), found.clone());
         Ok(found)
     }
 

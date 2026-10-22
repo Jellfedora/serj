@@ -2,7 +2,9 @@
 //! ajoutés, avec leur couverture. Les couvertures sont rendues en tâche de fond
 //! et gardées dans le cache, pour s'afficher tout de suite la fois suivante.
 //! Celles des tomes qui manquent sont téléchargées (BnF, Open Library).
-//! Les albums ajoutés sont copiés dans le dossier de Serj, rangés par série.
+//! Les albums ajoutés sont copiés dans le dossier de Serj, rangés par série ;
+//! les livres à part, dans « Livres ». Un PDF fait surtout de texte est
+//! reconnu comme un livre, en tâche de fond aussi.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -10,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use serj::pdf::Document;
+use serj::{archive, document, ebook};
 
 /// Hauteur des couvertures rendues, en pixels.
 const COVER_HEIGHT: f32 = 480.0;
@@ -48,6 +50,9 @@ pub struct Library {
     /// Les copies faites : l'original et sa copie.
     copied: Receiver<(PathBuf, PathBuf)>,
     copying: Arc<Mutex<Copying>>,
+    /// Les PDF dont on cherche s'ils sont des livres, et les réponses.
+    kinds: Sender<PathBuf>,
+    detected: Receiver<(PathBuf, bool)>,
 }
 
 impl Library {
@@ -121,7 +126,24 @@ impl Library {
                 }
             })
             .expect("thread des copies");
+        // À part encore : lire un PDF pour savoir si c'est un livre.
+        let (kinds, inbox) = channel::<PathBuf>();
+        let (outbox, detected) = channel();
+        std::thread::Builder::new()
+            .name("serj-rayons".into())
+            .spawn(move || {
+                for path in inbox {
+                    let text = std::fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serj::pdf::Document::open(bytes).ok())
+                        .is_some_and(|doc| doc.mostly_text());
+                    let _ = outbox.send((path, text));
+                }
+            })
+            .expect("thread des rayons");
         Self {
+            kinds,
+            detected,
             covers: HashMap::new(),
             requests,
             downloads,
@@ -132,18 +154,25 @@ impl Library {
         }
     }
 
-    /// Copie l'album `path` dans le dossier de Serj (sous `series` s'il en a
-    /// une), en tâche de fond ; rien s'il y est déjà.
-    pub fn import(&self, path: &Path, series: Option<&str>) {
+    /// Cherche si le PDF `path` est un livre (réponse dans [`Self::detected`]).
+    pub fn detect(&self, path: &Path) {
+        let _ = self.kinds.send(path.to_path_buf());
+    }
+
+    /// Les PDF examinés depuis la dernière fois : vrai pour un livre.
+    pub fn detected(&self) -> Vec<(PathBuf, bool)> {
+        self.detected.try_iter().collect()
+    }
+
+    /// Copie l'album `path` dans le dossier de Serj (sous `folder`, voir
+    /// [`folder`]), en tâche de fond ; rien s'il y est déjà.
+    pub fn import(&self, path: &Path, folder: PathBuf) {
         let Some(dir) = books_dir() else { return };
         let Some(name) = path.file_name() else { return };
         if path.starts_with(&dir) {
             return;
         }
-        let dir = match series.and_then(serj::meta::file_safe) {
-            Some(series) => dir.join(series),
-            None => dir,
-        };
+        let dir = dir.join(folder);
         let size = std::fs::metadata(path).map_or(0, |m| m.len());
         {
             let mut p = self.copying.lock().unwrap();
@@ -201,6 +230,36 @@ impl Library {
     }
 }
 
+/// Où ranger un album dans le dossier de Serj : sous sa série (« Lanfeust de
+/// Troy »), un livre dans « Livres », sous sa série ou son auteur.
+pub fn folder(livre: bool, series: Option<&str>, author: Option<&str>) -> PathBuf {
+    let mut folder = PathBuf::new();
+    if livre {
+        folder.push("Livres");
+    }
+    let name = match livre {
+        true => series.or(author),
+        false => series,
+    };
+    if let Some(name) = name.and_then(serj::meta::file_safe) {
+        folder.push(name);
+    }
+    folder
+}
+
+/// Les fichiers que Serj sait lire : PDF, CBZ, CBR et livres en texte.
+pub fn is_book(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        || archive::is_archive(path)
+        || ebook::is_ebook(path)
+}
+
+/// Les extensions que Serj sait lire, pour les fenêtres d'ouverture.
+pub const EXTENSIONS: [&str; 9] = [
+    "pdf", "cbz", "cbr", "epub", "mobi", "azw3", "azw", "fb2", "txt",
+];
+
 /// Le dossier où Serj range ses copies des albums.
 pub fn books_dir() -> Option<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "Serj")?;
@@ -221,16 +280,20 @@ pub fn open_books_dir() {
 }
 
 /// Met l'album `path` à la corbeille, s'il est dans le dossier de Serj (jamais
-/// un original ailleurs), et retire le dossier de sa série s'il est vide.
+/// un original ailleurs), et retire le dossier de sa série s'il est vide (et
+/// « Livres » aussi).
 pub fn delete(path: &Path) {
     let Some(books) = books_dir() else { return };
     if !path.starts_with(&books) || trash::delete(path).is_err() {
         return;
     }
-    if let Some(dir) = path.parent()
-        && dir != books
+    let mut dir = path.parent();
+    while let Some(d) = dir
+        && d != books
+        && d.starts_with(&books)
+        && std::fs::remove_dir(d).is_ok()
     {
-        let _ = std::fs::remove_dir(dir);
+        dir = d.parent();
     }
 }
 
@@ -371,7 +434,7 @@ pub fn scan(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
         }
         if path.is_dir() {
             scan(&path, depth + 1, found);
-        } else if crate::app::is_pdf(&path) {
+        } else if is_book(&path) {
             found.push(path);
         }
     }
@@ -392,7 +455,8 @@ fn cache_file(path: &Path) -> Option<PathBuf> {
     )
 }
 
-/// La première page de `path`, en petit : depuis le cache, sinon rendue.
+/// La première page de `path`, en petit : depuis le cache, sinon rendue (pour
+/// un livre en texte, l'image de couverture qu'il porte).
 fn cover(path: &Path) -> Option<egui::ColorImage> {
     let cached = cache_file(path);
     let image = cached
@@ -400,10 +464,24 @@ fn cover(path: &Path) -> Option<egui::ColorImage> {
         .and_then(|f| image::open(f).ok())
         .map(|i| i.to_rgba8())
         .or_else(|| {
-            let doc = Document::open(std::fs::read(path).ok()?).ok()?;
-            let page = doc.render(0, COVER_HEIGHT)?;
-            let image =
-                image::RgbaImage::from_raw(page.width as u32, page.height as u32, page.rgba)?;
+            let image = if ebook::is_ebook(path) {
+                let bytes = ebook::metadata(path)?.1?;
+                let image = image::load_from_memory(&bytes).ok()?;
+                let scale = COVER_HEIGHT / image.height().max(1) as f32;
+                let image = if scale < 1.0 {
+                    image.resize(
+                        (image.width() as f32 * scale) as u32,
+                        COVER_HEIGHT as u32,
+                        image::imageops::FilterType::Triangle,
+                    )
+                } else {
+                    image
+                };
+                image.to_rgba8()
+            } else {
+                let page = document::cover(path, COVER_HEIGHT)?;
+                image::RgbaImage::from_raw(page.width as u32, page.height as u32, page.rgba)?
+            };
             if let Some(file) = &cached {
                 if let Some(dir) = file.parent() {
                     let _ = std::fs::create_dir_all(dir);

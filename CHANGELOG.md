@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0]
+
+- Les livres : EPUB, MOBI, AZW3, FB2 et TXT (sans DRM), mis en page par Serj à la taille de la fenêtre — texte justifié, alinéas, titres de chapitre, images ; sur deux colonnes quand la fenêtre est large. On tourne les pages au clavier, au clic, à la molette ou en glissant la page, qui glisse un peu et se fond dans la suivante.
+- Réglages de lecture, dans la barre du haut : taille du texte (− / +), police avec ou sans empattements (PT Serif, PT Sans), fond des pages (thème, blanc, sépia, nuit) ; retenus d'une fois sur l'autre. Le sommaire mène à chaque chapitre ; en marge, le chapitre en cours, la page et la part lue.
+- Les PDF de texte (romans, essais) sont reconnus tout seuls et se lisent page par page, sans cases, avec la même page qui tourne.
+- Les BD et mangas en CBZ et CBR.
+- Trois onglets dans la bibliothèque : BD, Mangas, Livres, avec leur compte. « Ranger dans » (clic droit sur une carte) change un album de rayon ; la fiche aussi (« Corriger »). La recherche fouille tous les rayons.
+- Les infos d'un livre viennent d'abord du livre lui-même (titre, auteurs, série, résumé, couverture), puis du catalogue de la BnF et de Wikipédia. Un livre sans couverture en reçoit une, à son titre.
+- Les livres ajoutés sont copiés dans « Livres », dans le dossier de Serj, sous leur série ou leur auteur.
+- Envoyer vers ma Kindle (clic droit sur un livre, ou sa fiche) : Serj envoie l'EPUB, le PDF ou le TXT par e-mail à l'adresse de la Kindle, depuis ton compte (Gmail, iCloud ou un autre serveur SMTP) ; le mot de passe reste dans le trousseau du système. Un bandeau suit l'envoi ; l'historique des envois (réussis ou non, avec « Renvoyer ») est dans les réglages.
+- De vrais réglages (le bouton à roue dentée de l'en-tête, à la place du numéro de version) : thème, lecture des livres (taille, police, fond des pages), dossier de Serj ; l'envoi vers la Kindle ; « À propos » (version, mises à jour, raccourcis, nouveautés).
+- La fiche montre le résumé en entier, à côté de la couverture ; elle ne défile que si l'écran est trop petit.
+- La présentation d'une série ne vient plus de l'article sur son adaptation (« Harry Potter (série télévisée) ») : les infos déjà trouvées sont cherchées une fois de plus.
+- Correction : la couverture d'un album copié pendant qu'elle se préparait restait en attente (« … »).
+
 ## [0.5.0]
 
 - Les BD ajoutées (« Ajouter des BD », glissées dans la fenêtre, ⌘ O) sont copiées dans le dossier de Serj, rangées par série (« Lanfeust de Troy/Lanfeust de Troy - Tome 2 - Thanos l'incongru.pdf ») ; les originaux ne sont pas touchés. La bibliothèque déjà là est copiée au premier lancement, et les PDF des dossiers ajoutés avant aussi (ces dossiers ne sont plus surveillés).

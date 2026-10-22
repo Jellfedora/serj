@@ -10,9 +10,11 @@ use serj::meta::Guess;
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Position {
+    /// Pour un livre en texte : le bloc (paragraphe) en haut de la page.
     pub page: usize,
+    /// Pour un livre en texte : le caractère de ce bloc où commence la page.
     pub panel: usize,
-    /// Pages de l'album et part lue (0 à 1), pour l'accueil.
+    /// Pages de l'album (blocs d'un livre en texte) et part lue (0 à 1), pour l'accueil.
     pub pages: usize,
     pub progress: f32,
     /// Manga : pages lues de la dernière à la première, cases de droite à gauche.
@@ -95,6 +97,59 @@ pub struct State {
     pub corrections: BTreeMap<String, Guess>,
     /// Le thème de l'interface (`widgets::THEMES`).
     pub theme: String,
+    /// Le rayon de chaque album, devinés (un PDF de texte est un livre) ou
+    /// choisis à la main ; sans entrée : une BD, ou un manga d'après `Position::manga`.
+    pub kinds: BTreeMap<String, Kind>,
+    /// L'onglet ouvert dans la bibliothèque.
+    pub shelf: Kind,
+    /// La mise en page des livres en texte.
+    pub typography: Typography,
+    /// L'envoi vers la Kindle (le mot de passe est dans le trousseau).
+    pub kindle: crate::kindle::Settings,
+    /// Les envois vers la Kindle, le plus récent d'abord.
+    pub sent: Vec<crate::kindle::Sent>,
+}
+
+/// Les rayons de la bibliothèque.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    Bd,
+    Manga,
+    Livre,
+}
+
+/// Le fond des pages d'un livre en texte.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Paper {
+    /// Celui du thème de l'appli.
+    #[default]
+    Theme,
+    White,
+    Sepia,
+    Night,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Typography {
+    /// Taille du texte, en points.
+    pub size: f32,
+    /// Sans empattements plutôt qu'avec.
+    pub sans: bool,
+    pub paper: Paper,
+}
+
+impl Default for Typography {
+    fn default() -> Self {
+        Self {
+            size: 19.0,
+            sans: false,
+            paper: Paper::Theme,
+        }
+    }
 }
 
 impl Default for State {
@@ -108,6 +163,11 @@ impl Default for State {
             auto_secs: 5.0,
             corrections: BTreeMap::new(),
             theme: "nuit".into(),
+            kinds: BTreeMap::new(),
+            shelf: Kind::Bd,
+            typography: Typography::default(),
+            kindle: crate::kindle::Settings::default(),
+            sent: Vec::new(),
         }
     }
 }
@@ -163,6 +223,7 @@ impl State {
         self.files.retain(|p| p != path);
         self.positions.remove(&key(path));
         self.corrections.remove(&key(path));
+        self.kinds.remove(&key(path));
     }
 
     pub fn position(&self, path: &Path) -> Position {
@@ -192,6 +253,43 @@ impl State {
         if let Some(c) = self.corrections.remove(&key(from)) {
             self.corrections.insert(key(to), c);
         }
+        if let Some(k) = self.kinds.remove(&key(from)) {
+            self.kinds.insert(key(to), k);
+        }
+    }
+
+    /// Le rayon de l'album `path` : un livre en texte est toujours un livre.
+    pub fn kind(&self, path: &Path) -> Kind {
+        if serj::ebook::is_ebook(path) {
+            return Kind::Livre;
+        }
+        match self.kinds.get(&key(path)) {
+            Some(Kind::Livre) => Kind::Livre,
+            _ if self.position(path).manga => Kind::Manga,
+            _ => Kind::Bd,
+        }
+    }
+
+    /// Range l'album `path` dans le rayon `kind` (un manga se lit de droite à gauche).
+    pub fn set_kind(&mut self, path: &Path, kind: Kind) {
+        self.kinds.insert(key(path), kind);
+        let mut pos = self.position(path);
+        if pos.manga != (kind == Kind::Manga) {
+            pos.set_manga(kind == Kind::Manga);
+            self.set_position(path, pos);
+        }
+    }
+
+    /// Le rayon de `path` a déjà été deviné ou choisi.
+    pub fn kind_known(&self, path: &Path) -> bool {
+        self.kinds.contains_key(&key(path))
+    }
+
+    /// Le PDF `path` a été examiné : un livre ou non (une BD, ou un manga
+    /// d'après `Position::manga`).
+    pub fn set_detected(&mut self, path: &Path, livre: bool) {
+        let kind = if livre { Kind::Livre } else { Kind::Bd };
+        self.kinds.insert(key(path), kind);
     }
 
     pub fn correction(&self, path: &Path) -> Option<&Guess> {

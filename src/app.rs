@@ -15,12 +15,16 @@ use serj::meta::{self, Guess, Info};
 use crate::infos::Infos;
 use crate::library;
 use crate::loader::{Event, LoadedPage, Loader};
-use crate::state::{Position, State};
+use crate::reader::TextBook;
+use crate::state::{Kind, Position, State};
 use crate::update::{self, Updater};
 use crate::widgets::{self, Icon, THEMES, Tone, theme};
 
 /// Durée du glissement d'une case à l'autre, et du zoom en arrivant sur une page.
 const MOVE_SECS: f64 = 0.38;
+/// Une page de livre qui tourne : sa durée, et de combien elle glisse.
+const TURN_SECS: f64 = 0.34;
+const TURN_SHIFT: f32 = 26.0;
 const ENTER_SECS: f64 = 0.55;
 /// Marge autour de la case à l'écran, en points.
 const SCREEN_MARGIN: f32 = 20.0;
@@ -75,6 +79,16 @@ struct Book {
     to_last_panel: bool,
     camera_move: Option<Move>,
     error: Option<String>,
+    /// Un livre en PDF : page par page, sans cases, et la page tourne.
+    livre: bool,
+    /// La page qu'on vient de quitter, qui s'efface (un livre seulement).
+    turn: Option<PageTurn>,
+}
+
+struct PageTurn {
+    from: usize,
+    forward: bool,
+    start: Option<f64>,
 }
 
 /// Ce que demandent le clavier, la souris, la barre d'outils ou la lecture
@@ -104,12 +118,14 @@ struct Clicks {
     open: Option<PathBuf>,
     add: bool,
     open_folder: bool,
-    about: bool,
+    /// Ouvrir les réglages.
+    settings: bool,
     forget: Option<PathBuf>,
+    /// Envoyer un livre vers la Kindle.
+    kindle: Option<PathBuf>,
     /// Supprimer l'album : sa copie part à la corbeille.
     delete: Option<PathBuf>,
     restart: Option<PathBuf>,
-    manga: Option<PathBuf>,
     infos: Option<PathBuf>,
     /// Ouvrir la fiche directement sur la correction.
     correct: Option<PathBuf>,
@@ -118,6 +134,10 @@ struct Clicks {
     series: Option<String>,
     close_series: bool,
     theme: Option<&'static str>,
+    /// L'onglet choisi.
+    shelf: Option<Kind>,
+    /// Ranger un album dans un autre rayon.
+    kind: Option<(PathBuf, Kind)>,
 }
 
 /// Une série de la bibliothèque (au moins deux albums), et ses albums dans
@@ -144,12 +164,14 @@ struct Draft {
     volume: String,
     title: String,
     authors: String,
-    manga: bool,
+    kind: Kind,
 }
 
 pub struct App {
     state: State,
     book: Option<Book>,
+    /// Le livre en texte ouvert (EPUB, MOBI…), à la place d'un album.
+    text: Option<TextBook>,
     hud_until: f64,
     scroll: f32,
     state_dirty_since: Option<f64>,
@@ -165,8 +187,12 @@ pub struct App {
     library: library::Library,
     infos: Infos,
     sheet: Option<Sheet>,
-    /// La fenêtre « À propos » est ouverte.
-    about: bool,
+    /// La fenêtre des réglages, ouverte.
+    settings: Option<crate::settings::Window>,
+    /// L'envoi des livres vers la Kindle, et le dernier fini (pour le dire
+    /// un moment dans l'accueil) avec l'instant où il l'a été.
+    mailer: crate::kindle::Mailer,
+    kindle_notice: Option<(u64, f64)>,
     /// Début de l'écran de démarrage (NaN avant la première image) ; None une
     /// fois fini.
     splash: Option<f64>,
@@ -187,6 +213,8 @@ pub struct App {
     /// Les albums de l'accueil, et quand ils ont été cherchés.
     books: Vec<PathBuf>,
     books_at: Option<f64>,
+    /// Les PDF dont on cherche s'ils sont des livres.
+    detecting: HashSet<PathBuf>,
 }
 
 impl App {
@@ -194,6 +222,7 @@ impl App {
         let mut app = Self {
             state: State::load(),
             book: None,
+            text: None,
             hud_until: 0.0,
             scroll: 0.0,
             state_dirty_since: None,
@@ -214,7 +243,9 @@ impl App {
             updater: Updater::new(),
             update_checked_at: None,
             update_tried: false,
-            about: false,
+            settings: None,
+            mailer: crate::kindle::Mailer::new(cc.egui_ctx.clone()),
+            kindle_notice: None,
             icon: image::load_from_memory(include_bytes!("../assets/icon/icon.png"))
                 .ok()
                 .map(|i| {
@@ -229,8 +260,10 @@ impl App {
             window_title: String::new(),
             books: Vec::new(),
             books_at: None,
+            detecting: HashSet::new(),
         };
         widgets::set_theme(&cc.egui_ctx, &app.state.theme);
+        widgets::install_fonts(&cc.egui_ctx);
         // Le fichier passé en argument, sinon le dernier album lu (sauf pour
         // tester l'accueil avec SERJ_ACCUEIL).
         let reopen = std::env::var_os("SERJ_ACCUEIL").is_none();
@@ -257,8 +290,26 @@ impl App {
         self.state.opened(&path);
         self.state.save();
         let position = self.state.position(&path);
+        self.auto_play = false;
+        self.auto_since = None;
+        self.hud_until = ctx.input(|i| i.time) + HUD_SECS;
+        if serj::ebook::is_ebook(&path) {
+            self.book = None;
+            self.text = Some(TextBook::open(path, position, ctx.clone()));
+            return;
+        }
+        self.text = None;
+        // Un PDF jamais examiné (ouvert tout de suite après l'ajout) : livre ou BD ?
+        if is_pdf(&path) && !self.state.kind_known(&path) {
+            let livre = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serj::pdf::Document::open(bytes).ok())
+                .is_some_and(|doc| doc.mostly_text());
+            self.state.set_detected(&path, livre);
+        }
+        let livre = self.state.kind(&path) == Kind::Livre;
         self.book = Some(Book {
-            loader: Loader::open(path.clone(), position.manga, ctx.clone()),
+            loader: Loader::open(path.clone(), position.manga, !livre, ctx.clone()),
             path,
             page_count: None,
             pages: HashMap::new(),
@@ -270,15 +321,20 @@ impl App {
                 secs: ENTER_SECS,
             }),
             error: None,
+            livre,
+            turn: None,
         });
-        self.auto_play = false;
-        self.auto_since = None;
-        self.hud_until = ctx.input(|i| i.time) + HUD_SECS;
+    }
+
+    /// Page entière : choisie, ou un livre (qui n'a pas de cases).
+    fn whole_page(&self) -> bool {
+        self.state.whole_page || self.book.as_ref().is_some_and(|b| b.livre)
     }
 
     fn close(&mut self, ctx: &egui::Context) {
         self.save_position();
         self.book = None;
+        self.text = None;
         self.auto_play = false;
         self.window_title.clear();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title("Serj".into()));
@@ -292,8 +348,10 @@ impl App {
         let Some(info) = self.infos.known(path) else {
             return;
         };
+        // Un livre qui dit lui-même son titre est sûr de son nom.
         let trusted = self.state.correction(path).is_some()
-            || info.sources.iter().any(|(source, _)| source == "BnF");
+            || info.sources.iter().any(|(source, _)| source == "BnF")
+            || crate::infos::embedded(path).is_some_and(|m| m.title.is_some());
         if !info.searched || !trusted {
             return;
         }
@@ -304,12 +362,16 @@ impl App {
             .extension()
             .map(|e| e.to_string_lossy().into_owned())
             .unwrap_or_else(|| "pdf".into());
-        // Une copie de Serj se range aussi dans le dossier de sa série.
+        // Une copie de Serj se range aussi dans le dossier de sa série (un
+        // livre dans « Livres »).
+        let livre = self.state.kind(path) == Kind::Livre;
+        let author = info.authors.first().map(|a| a.name.clone());
         let dir = match library::books_dir().filter(|d| path.starts_with(d)) {
-            Some(books) => match info.series.as_deref().and_then(meta::file_safe) {
-                Some(series) => books.join(series),
-                None => books,
-            },
+            Some(books) => books.join(library::folder(
+                livre,
+                info.series.as_deref(),
+                author.as_deref(),
+            )),
             None => path.parent().map(Path::to_path_buf).unwrap_or_default(),
         };
         let target = dir.join(format!("{name}.{extension}"));
@@ -321,11 +383,17 @@ impl App {
         if std::fs::create_dir_all(&dir).is_err() || std::fs::rename(path, &target).is_err() {
             return;
         }
-        // Le dossier de la série devinée d'après le nom du fichier, s'il est vide.
-        if let Some(old) = path.parent()
-            && library::books_dir().is_some_and(|books| old != books && old.starts_with(&books))
-        {
-            let _ = std::fs::remove_dir(old);
+        // Le dossier de la série devinée d'après le nom du fichier, s'il est
+        // vide (et « Livres » au-dessus, de même).
+        if let Some(books) = library::books_dir() {
+            let mut dir = path.parent();
+            while let Some(d) = dir
+                && d != books
+                && d.starts_with(&books)
+                && std::fs::remove_dir(d).is_ok()
+            {
+                dir = d.parent();
+            }
         }
         self.moved(path, &target);
     }
@@ -341,7 +409,11 @@ impl App {
             .cloned()
             .unwrap_or_else(|| crate::infos::file_guess(&target));
         self.infos.moved(path, &target, query);
-        if let Some(cover) = self.library.covers.remove(path) {
+        // Une couverture prête suit le fichier ; une en cours arrivera sous
+        // l'ancien nom : on la redemandera sous le nouveau.
+        if let Some(cover) = self.library.covers.remove(path)
+            && matches!(cover, library::Cover::Ready(_))
+        {
             self.library.covers.insert(target.clone(), cover);
         }
         for b in &mut self.books {
@@ -354,6 +426,11 @@ impl App {
         {
             book.path = target.clone();
         }
+        if let Some(text) = &mut self.text
+            && text.path == path
+        {
+            text.path = target.clone();
+        }
         if let Some(sheet) = &mut self.sheet
             && sheet.path == path
         {
@@ -363,9 +440,14 @@ impl App {
 
     /// Les infos de l'album `path` (demandées au besoin).
     fn info(&mut self, path: &Path) -> &Info {
-        let manga = self.state.position(path).manga;
+        let kind = self.state.kind(path);
         let correction = self.state.correction(path).cloned();
-        self.infos.get(path, manga, correction.as_ref())
+        self.infos.get(
+            path,
+            kind == Kind::Manga,
+            kind == Kind::Livre,
+            correction.as_ref(),
+        )
     }
 
     /// Le nom complet de l'album : « Lanfeust de Troy 2 · Thanos l'incongru ».
@@ -373,32 +455,40 @@ impl App {
         self.info(path).full_title().unwrap_or_else(|| title(path))
     }
 
-    /// Ajoute des PDF et les PDF des dossiers à la bibliothèque, et les copie
-    /// dans le dossier de Serj : la copie remplace l'original une fois faite.
+    /// Ajoute des albums et livres (et ceux des dossiers) à la bibliothèque, et
+    /// les copie dans le dossier de Serj : la copie remplace l'original une
+    /// fois faite.
     fn import(&mut self, paths: &[PathBuf]) {
-        let mut pdfs = Vec::new();
+        let mut found = Vec::new();
         for p in paths {
             if p.is_dir() {
-                library::scan(p, 0, &mut pdfs);
-            } else if is_pdf(p) {
-                pdfs.push(p.clone());
+                library::scan(p, 0, &mut found);
+            } else if library::is_book(p) {
+                found.push(p.clone());
             }
         }
-        for pdf in &pdfs {
+        for book in &found {
             let guess = self
                 .state
-                .correction(pdf)
+                .correction(book)
                 .cloned()
-                .unwrap_or_else(|| crate::infos::file_guess(pdf));
-            self.library.import(pdf, guess.series.as_deref());
+                .unwrap_or_else(|| crate::infos::file_guess(book));
+            let livre = self.state.kind(book) == Kind::Livre;
+            let folder = library::folder(
+                livre,
+                guess.series.as_deref(),
+                guess.authors.first().map(String::as_str),
+            );
+            self.library.import(book, folder);
         }
-        self.state.add(pdfs);
+        self.state.add(found);
         self.state.save();
         self.books_at = None;
     }
 
     fn pick_file(&mut self, ctx: &egui::Context) {
-        let mut dialog = rfd::FileDialog::new().add_filter("BD en PDF", &["pdf", "PDF"]);
+        let mut dialog =
+            rfd::FileDialog::new().add_filter("BD, mangas et livres", &library::EXTENSIONS);
         if let Some(dir) = self.state.recents.first().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(dir);
         }
@@ -408,13 +498,13 @@ impl App {
         }
     }
 
-    /// Ajoute à la bibliothèque des PDF et des dossiers choisis ensemble (sur
-    /// macOS ; ailleurs, des PDF seulement : les dossiers se glissent dans la
-    /// fenêtre).
+    /// Ajoute à la bibliothèque des fichiers et des dossiers choisis ensemble
+    /// (sur macOS ; ailleurs, des fichiers seulement : les dossiers se glissent
+    /// dans la fenêtre).
     fn add_books(&mut self) {
         let dialog = rfd::FileDialog::new()
-            .set_title("Ajouter des BD")
-            .add_filter("BD en PDF", &["pdf", "PDF"]);
+            .set_title("Ajouter à la bibliothèque")
+            .add_filter("BD, mangas et livres", &library::EXTENSIONS);
         #[cfg(target_os = "macos")]
         let picked = dialog.pick_files_or_folders();
         #[cfg(not(target_os = "macos"))]
@@ -427,6 +517,11 @@ impl App {
     fn save_position(&mut self) {
         if let Some(book) = &self.book {
             self.state.set_position(&book.path, book.position);
+        }
+        if let Some(text) = &self.text
+            && text.ready()
+        {
+            self.state.set_position(&text.path, text.position);
         }
         self.state.save();
         self.state_dirty_since = None;
@@ -718,19 +813,19 @@ impl eframe::App for App {
             self.update_checked_at = Some(now);
         }
 
-        // Glissés dans la fenêtre : un PDF seul s'ouvre, plusieurs PDF ou des
-        // dossiers s'ajoutent à la bibliothèque.
+        // Glissés dans la fenêtre : un fichier seul s'ouvre, plusieurs fichiers
+        // ou des dossiers s'ajoutent à la bibliothèque.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
                 .map(|f| f.path().to_path_buf())
-                .filter(|p| p.is_dir() || is_pdf(p))
+                .filter(|p| p.is_dir() || library::is_book(p))
                 .collect()
         });
         match dropped.as_slice() {
             [] => {}
-            [one] if is_pdf(one) => {
+            [one] if library::is_book(one) => {
                 self.import(&dropped);
                 self.open(&ctx, one.clone());
             }
@@ -749,22 +844,24 @@ impl eframe::App for App {
                 library::delete(&to);
             }
         }
+        self.receive_mail(now);
         for path in self.infos.receive() {
             self.rename(&path);
         }
         let area = ui.max_rect();
         ui.painter().rect_filled(area, 0.0, theme().background);
-        if self.book.is_some() {
+        if self.text.is_some() {
+            self.reading_text(ui, &ctx, area, now);
+        } else if self.book.is_some() {
             self.reading(ui, &ctx, area, now);
         } else {
             self.welcome(ui, &ctx, area, now);
         }
 
         if let Some(shots) = &mut self.shots {
-            let idle = self
-                .book
-                .as_ref()
-                .is_none_or(|b| b.camera_move.is_none() && b.current().is_some());
+            let idle = self.book.as_ref().is_none_or(|b| {
+                b.camera_move.is_none() && b.current().is_some() && b.turn.is_none()
+            }) && self.text.as_ref().is_none_or(TextBook::idle);
             self.auto_next = shots.frame(&ctx, now, idle);
         }
 
@@ -791,11 +888,32 @@ impl App {
             self.books = library::books(&self.state.recents, &self.state.files);
             self.books_at = Some(now);
         }
+        // Les PDF : des livres ou des BD ? Cherché une fois pour chacun.
+        let detected = self.library.detected();
+        for (path, livre) in &detected {
+            self.state.set_detected(path, *livre);
+        }
+        if !detected.is_empty() {
+            self.state.save();
+        }
+        for p in &self.books {
+            if is_pdf(p) && !self.state.kind_known(p) && self.detecting.insert(p.clone()) {
+                self.library.detect(p);
+            }
+        }
         // Le nom du fichier tout de suite, ce qu'on trouve en ligne ensuite.
-        let books = self.books.clone();
-        let infos: HashMap<PathBuf, Info> = books
+        let all = self.books.clone();
+        let infos: HashMap<PathBuf, Info> = all
             .iter()
             .map(|p| (p.clone(), self.info(p).clone()))
+            .collect();
+        // L'onglet ouvert : ses albums seulement.
+        let shelf = self.state.shelf;
+        let counts = SHELVES.map(|k| all.iter().filter(|p| self.state.kind(p) == k).count());
+        let books: Vec<PathBuf> = all
+            .iter()
+            .filter(|p| self.state.kind(p) == shelf)
+            .cloned()
             .collect();
         let (series, others) = group(&books, &infos);
         let in_progress = |state: &State, p: &PathBuf| state.position(p).in_progress();
@@ -808,7 +926,7 @@ impl App {
             .cloned();
         let stats = {
             let reading = books.iter().filter(|p| in_progress(&self.state, p)).count();
-            let mut parts = vec![plural(books.len(), "album", "albums")];
+            let mut parts = vec![noun(shelf, books.len())];
             if !series.is_empty() {
                 parts.push(plural(series.len(), "série", "séries"));
             }
@@ -870,7 +988,7 @@ impl App {
                                         .strong()
                                         .color(theme().text),
                                 );
-                                let under = if books.is_empty() {
+                                let under = if all.is_empty() {
                                     "Une case à la fois.".to_string()
                                 } else {
                                     stats.clone()
@@ -889,31 +1007,33 @@ impl App {
                                     clicks.add |= widgets::button(
                                         ui,
                                         Some(Icon::Plus),
-                                        label("Ajouter des BD"),
+                                        label("Ajouter"),
                                         Tone::Primary,
                                     )
                                     .on_hover_text(
-                                        "Des PDF ou des dossiers entiers ; ou glisse-les dans la fenêtre",
+                                        "BD, mangas et livres : PDF, CBZ, CBR, EPUB, MOBI, AZW3, FB2, TXT, \
+                                         ou des dossiers entiers ; ou glisse-les dans la fenêtre",
                                     )
                                     .clicked();
                                     clicks.open_folder |= widgets::button(
                                         ui,
                                         Some(Icon::Folder),
-                                        label("Dossier des BD"),
+                                        label("Dossier"),
                                         Tone::Plain,
                                     )
                                     .on_hover_text(
-                                        "Ouvrir le dossier où Serj copie les BD ajoutées, rangées par série",
+                                        "Ouvrir le dossier où Serj copie ce que tu ajoutes, rangé par série \
+                                         (les livres dans « Livres »)",
                                     )
                                     .clicked();
-                                    clicks.about |= widgets::button(
+                                    clicks.settings |= widgets::button(
                                         ui,
-                                        None,
-                                        &format!("v{}", update::VERSION),
+                                        Some(Icon::Gear),
+                                        label("Réglages"),
                                         Tone::Plain,
                                     )
                                     .on_hover_text(
-                                        "À propos de Serj : mises à jour, nouveautés, raccourcis",
+                                        "Thème, lecture, envoi vers la Kindle, mises à jour et à propos",
                                     )
                                     .clicked();
                                     ui.add_space(14.0);
@@ -925,7 +1045,7 @@ impl App {
                         .response
                         .rect;
                     let room = right_start - left_end - 64.0;
-                    let inline_search = !books.is_empty() && room >= 300.0;
+                    let inline_search = !all.is_empty() && room >= 300.0;
                     if inline_search {
                         let width = room.min(560.0);
                         let center = pos2((left_end + right_start) / 2.0, header.center().y);
@@ -938,24 +1058,30 @@ impl App {
 
                     self.update_banner(ui, ctx);
                     self.copy_banner(ui);
+                    self.kindle_banner(ui, now);
+                    if !all.is_empty() {
+                        ui.add_space(26.0);
+                        clicks.shelf = shelf_tabs(ui, shelf, counts);
+                    }
 
                     let browsing = self.search.is_empty() && self.open_series.is_none();
                     if browsing && let Some(path) = &featured {
                         ui.add_space(30.0);
                         self.hero(ui, path, &infos[path], &mut clicks);
                     }
-                    if !books.is_empty() && !inline_search {
+                    if !all.is_empty() && !inline_search {
                         ui.add_space(30.0);
                         self.search_box(ui);
                     }
 
-                    if books.is_empty() {
+                    if all.is_empty() {
                         empty_library(ui);
                         return;
                     }
+                    // La recherche fouille tous les rayons.
                     let query = meta::normalize(&self.search);
                     if !query.is_empty() {
-                        let found: Vec<(PathBuf, String)> = books
+                        let found: Vec<(PathBuf, String)> = all
                             .iter()
                             .filter(|p| matches(&infos[*p], p, &query))
                             .map(|p| (p.clone(), full_label(&infos[p], p)))
@@ -964,7 +1090,7 @@ impl App {
                             ui.add_space(40.0);
                             ui.vertical_centered(|ui| {
                                 ui.label(
-                                    egui::RichText::new("Aucun album ne correspond")
+                                    egui::RichText::new("Rien ne correspond")
                                         .size(17.0)
                                         .color(theme().text),
                                 );
@@ -988,6 +1114,10 @@ impl App {
                         }
                         clicks.close_series = true;
                     }
+                    if books.is_empty() {
+                        empty_shelf(ui, shelf);
+                        return;
+                    }
                     let reading: Vec<(PathBuf, String)> = books
                         .iter()
                         .filter(|p| in_progress(&self.state, p) && Some(*p) != featured.as_ref())
@@ -1007,10 +1137,11 @@ impl App {
                         .cloned()
                         .collect();
                     if !rest.is_empty() {
-                        let name = if series.is_empty() {
-                            "Bibliothèque"
-                        } else {
-                            "Albums"
+                        let name = match (series.is_empty(), shelf) {
+                            (true, _) => "Bibliothèque",
+                            (false, Kind::Bd) => "Albums",
+                            (false, Kind::Manga) => "Mangas",
+                            (false, Kind::Livre) => "Livres",
                         };
                         self.shelf(ui, name, &rest, &mut clicks);
                     }
@@ -1046,12 +1177,6 @@ impl App {
             );
             self.state.save();
         }
-        if let Some(path) = clicks.manga {
-            let mut pos = self.state.position(&path);
-            pos.set_manga(!pos.manga);
-            self.state.set_position(&path, pos);
-            self.state.save();
-        }
         if let Some(path) = clicks.infos {
             self.sheet = Some(Sheet { path, draft: None });
         }
@@ -1073,12 +1198,21 @@ impl App {
         // Échap referme la série (sauf pendant une saisie ou sur la fiche).
         let typing = ctx.memory(|m| m.focused().is_some());
         let escape = ctx.input(|i| i.key_pressed(Key::Escape));
-        let modal = self.sheet.is_some() || self.about;
+        let modal = self.sheet.is_some() || self.settings.is_some();
         if clicks.close_series || (escape && !typing && !modal) {
             self.open_series = None;
         }
         if let Some(key) = clicks.series {
             self.open_series = Some(key);
+        }
+        if let Some(kind) = clicks.shelf {
+            self.state.shelf = kind;
+            self.open_series = None;
+            self.state.save();
+        }
+        if let Some((path, kind)) = clicks.kind {
+            self.state.set_kind(&path, kind);
+            self.state.save();
         }
         if let Some(id) = clicks.theme {
             self.state.theme = id.to_string();
@@ -1089,16 +1223,216 @@ impl App {
             self.sheet = None;
             self.open(ctx, path);
         }
-        self.about |= clicks.about;
-        self.sheet(ctx);
-        if self.about {
-            let out = crate::about::show(ctx, &self.updater, self.icon.as_ref());
-            if out.relaunch && self.updater.relaunch().is_ok() {
-                self.save_position();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            self.about &= !out.close;
+        if clicks.settings {
+            self.settings = Some(crate::settings::Window::new(
+                &self.state,
+                crate::settings::Tab::General,
+            ));
         }
+        if let Some(path) = clicks.kindle {
+            self.send_to_kindle(&path);
+        }
+        self.sheet(ctx);
+        self.settings_window(ctx);
+    }
+
+    /// La fenêtre des réglages, si elle est ouverte.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let Some(window) = self.settings.as_mut() else {
+            return;
+        };
+        let out = crate::settings::show(
+            ctx,
+            window,
+            &mut self.state,
+            &self.updater,
+            self.icon.as_ref(),
+        );
+        if let Some(id) = out.theme {
+            self.state.theme = id.to_string();
+            widgets::set_theme(ctx, id);
+            self.state.save();
+        }
+        if out.changed {
+            self.state.save();
+        }
+        if out.open_folder {
+            library::open_books_dir();
+        }
+        if out.test {
+            self.mailer.test(&self.state.kindle);
+        }
+        if let Some(id) = out.resend
+            && let Some(path) = self
+                .state
+                .sent
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.path.clone())
+        {
+            self.send_to_kindle(&path);
+        }
+        if out.relaunch && self.updater.relaunch().is_ok() {
+            self.save_position();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if out.close {
+            self.settings = None;
+        }
+    }
+
+    /// Envoie le livre `path` vers la Kindle, en tâche de fond ; sans
+    /// adresse, ouvre d'abord les réglages.
+    fn send_to_kindle(&mut self, path: &Path) {
+        use crate::kindle::{Sent, Status};
+        if !self.state.kindle.ready() {
+            let mut window =
+                crate::settings::Window::new(&self.state, crate::settings::Tab::Kindle);
+            window.message = Some(Err(
+                "Indique d'abord l'adresse de ta Kindle et ton compte d'envoi.".into(),
+            ));
+            self.settings = Some(window);
+            return;
+        }
+        let at = crate::kindle::now();
+        // Un identifiant qui ne revient pas, même pour deux envois la même seconde.
+        let id = at * 1000 + self.state.sent.len() as u64 % 1000;
+        let title = self.label(path);
+        let status = match crate::kindle::refusal(path) {
+            Some(why) => Status::Failed(why),
+            None => {
+                self.mailer.send(id, path, &title, &self.state.kindle);
+                Status::Sending
+            }
+        };
+        if !matches!(status, Status::Sending) {
+            self.kindle_notice = Some((id, f64::NAN));
+        }
+        crate::kindle::record(
+            &mut self.state.sent,
+            Sent {
+                id,
+                path: path.to_path_buf(),
+                title,
+                to: self.state.kindle.kindle.trim().to_string(),
+                at,
+                status,
+            },
+        );
+        self.state.save();
+    }
+
+    /// Les réponses du fil d'envoi : l'historique, et l'essai de connexion.
+    fn receive_mail(&mut self, now: f64) {
+        use crate::kindle::{Done, Status};
+        for done in self.mailer.done() {
+            match done {
+                Done::Sent { id, result } => {
+                    if let Some(sent) = self.state.sent.iter_mut().find(|s| s.id == id) {
+                        sent.status = match result {
+                            Ok(()) => Status::Sent,
+                            Err(e) => Status::Failed(e),
+                        };
+                    }
+                    self.kindle_notice = Some((id, now));
+                    self.state.save();
+                }
+                Done::Tested(result) => {
+                    if let Some(w) = &mut self.settings {
+                        w.testing = false;
+                        w.message = Some(result.map(|()| {
+                            "Connexion réussie : tout est prêt pour envoyer.".to_string()
+                        }));
+                    }
+                }
+            }
+        }
+        if let Some((_, at)) = &mut self.kindle_notice
+            && at.is_nan()
+        {
+            *at = now;
+        }
+    }
+
+    /// L'envoi vers la Kindle en cours, ou celui qui vient de finir.
+    fn kindle_banner(&mut self, ui: &mut egui::Ui, now: f64) {
+        use crate::kindle::Status;
+        let sending: Vec<&crate::kindle::Sent> = self
+            .state
+            .sent
+            .iter()
+            .filter(|s| s.status == Status::Sending)
+            .collect();
+        let finished = self
+            .kindle_notice
+            .filter(|(_, at)| now - at < 8.0)
+            .and_then(|(id, _)| self.state.sent.iter().find(|s| s.id == id));
+        let (title, detail, failed) = match (sending.first(), finished) {
+            (Some(s), _) => (
+                format!("Envoi de « {} » vers ta Kindle…", s.title),
+                format!("vers {}", s.to),
+                false,
+            ),
+            (None, Some(s)) => match &s.status {
+                Status::Failed(e) => (
+                    format!("« {} » n'a pas pu partir", s.title),
+                    e.clone(),
+                    true,
+                ),
+                _ => (
+                    format!("« {} » est parti vers ta Kindle", s.title),
+                    "Il y arrivera dans quelques minutes (la Kindle doit être connectée).".into(),
+                    false,
+                ),
+            },
+            (None, None) => return,
+        };
+        ui.add_space(24.0);
+        let t = theme();
+        let mut open = false;
+        egui::Frame::new()
+            .fill(t.surface)
+            .corner_radius(16)
+            .inner_margin(egui::Margin::symmetric(18, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+                    let fill = if failed {
+                        Color32::from_rgb(0xE5, 0x5B, 0x4F)
+                    } else {
+                        t.accent
+                    };
+                    ui.painter().circle_filled(r.center(), 18.0, fill);
+                    widgets::icon(ui.painter(), Icon::Send, r.center(), 18.0, t.on_accent);
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(title).size(15.5).strong().color(t.text),
+                            )
+                            .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(detail).size(12.5).color(t.muted))
+                                .wrap(),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        open = widgets::button(ui, None, "Historique", Tone::Plain).clicked();
+                        if !sending.is_empty() {
+                            ui.spinner();
+                        }
+                    });
+                });
+            });
+        if open {
+            self.settings = Some(crate::settings::Window::new(
+                &self.state,
+                crate::settings::Tab::Kindle,
+            ));
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
     }
 
     /// La barre de recherche : ⌘ F pour y aller, Échap pour l'effacer.
@@ -1478,12 +1812,7 @@ impl App {
         painter.text(
             pos2(track.right() + 12.0, track.center().y),
             Align2::LEFT_CENTER,
-            format!(
-                "Page {} / {}   ·   {}",
-                pos.rank(pos.page) + 1,
-                pos.pages,
-                percent(pos.progress)
-            ),
+            where_at(path, &pos),
             FontId::proportional(12.5),
             theme().muted,
         );
@@ -1595,7 +1924,7 @@ impl App {
         widgets::badge(
             &painter,
             cover_rect.min + vec2(8.0, 8.0),
-            &format!("{n} albums"),
+            &noun(self.state.shelf, n),
             Color32::from_black_alpha(200),
             Color32::WHITE,
         );
@@ -1642,7 +1971,7 @@ impl App {
             theme().text,
         );
         let mut status = match done {
-            0 => format!("{n} albums"),
+            0 => noun(self.state.shelf, n),
             d if d == n => "Tout lu".to_string(),
             d => format!("{d} lus sur {n}"),
         };
@@ -1679,7 +2008,7 @@ impl App {
                     .strong()
                     .color(theme().text),
             );
-            let mut count = format!("{} albums", s.books.len());
+            let mut count = noun(self.state.shelf, s.books.len());
             if !s.missing.is_empty() {
                 count += &format!(
                     "   ·   {}",
@@ -1714,7 +2043,12 @@ impl App {
         if widgets::button(ui, None, label, Tone::Plain).clicked() {
             clicks.mark_read = Some((paths, read));
         }
-        self.shelf(ui, "Albums", &s.books, clicks);
+        let title = match self.state.shelf {
+            Kind::Bd => "Albums",
+            Kind::Manga => "Tomes",
+            Kind::Livre => "Livres",
+        };
+        self.shelf(ui, title, &s.books, clicks);
         if !s.missing.is_empty() {
             self.missing_shelf(ui, s);
         }
@@ -1725,14 +2059,14 @@ impl App {
     fn missing_shelf(&mut self, ui: &mut egui::Ui, s: &Series) {
         const SHOWN: usize = 24;
         section_title(ui, "Tomes manquants", s.missing.len());
-        let manga = self.state.position(&s.books[0].0).manga;
+        let kind = self.state.kind(&s.books[0].0);
         let (cols, card_w, gap) = columns(ui.available_width());
         let shown = &s.missing[..s.missing.len().min(SHOWN)];
         for row in shown.chunks(cols) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
                 for &v in row {
-                    self.missing_card(ui, &s.name, v, manga, card_w);
+                    self.missing_card(ui, &s.name, v, kind, card_w);
                 }
             });
             ui.add_space(gap);
@@ -1749,8 +2083,10 @@ impl App {
     /// Un tome qu'on n'a pas : sa couverture en ligne (ou un cadre en
     /// pointillés), son titre, son année. Au survol, ses infos ; au clic, sa
     /// notice.
-    fn missing_card(&mut self, ui: &mut egui::Ui, series: &str, v: u32, manga: bool, width: f32) {
-        let (key, info) = self.infos.volume(series, v, manga);
+    fn missing_card(&mut self, ui: &mut egui::Ui, series: &str, v: u32, kind: Kind, width: f32) {
+        let (key, info) = self
+            .infos
+            .volume(series, v, kind == Kind::Manga, kind == Kind::Livre);
         let info = info.clone();
         let pending = self.infos.pending(&key);
         let cover = match self.library.web_cover(&key, &info.covers) {
@@ -1926,13 +2262,34 @@ impl App {
                         if ui.button(label).clicked() {
                             clicks.mark_read = Some((vec![path.clone()], read));
                         }
-                        let manga = if pos.manga {
-                            "Lire comme une BD"
-                        } else {
-                            "Lire comme un manga"
+                        // Un livre en texte n'a qu'un rayon ; un PDF ou une
+                        // archive peut changer de rayon.
+                        let refusal = crate::kindle::refusal(path);
+                        let send = ui.add_enabled(
+                            refusal.is_none(),
+                            egui::Button::new("Envoyer vers ma Kindle"),
+                        );
+                        let send = match &refusal {
+                            Some(why) => send.on_disabled_hover_text(why),
+                            None => send,
                         };
-                        if ui.button(manga).clicked() {
-                            clicks.manga = Some(path.clone());
+                        if send.clicked() {
+                            clicks.kindle = Some(path.clone());
+                        }
+                        if !serj::ebook::is_ebook(path) {
+                            let current = self.state.kind(path);
+                            ui.menu_button("Ranger dans", |ui| {
+                                for (kind, name) in [
+                                    (Kind::Bd, "BD"),
+                                    (Kind::Manga, "Mangas"),
+                                    (Kind::Livre, "Livres"),
+                                ] {
+                                    if ui.radio(current == kind, name).clicked() && current != kind
+                                    {
+                                        clicks.kind = Some((path.clone(), kind));
+                                    }
+                                }
+                            });
                         }
                         if pos.in_progress() && ui.button("Recommencer au début").clicked() {
                             clicks.restart = Some(path.clone());
@@ -1996,10 +2353,16 @@ impl App {
                     .paint_at(ui, r);
                 r
             }
+            library::Cover::Failed if serj::ebook::is_ebook(path) => {
+                // Un livre sans couverture : une couverture de titre.
+                let info = self.info(path).clone();
+                generated_cover(&painter, slot, &info, path);
+                slot
+            }
             cover => {
                 let failed = matches!(cover, library::Cover::Failed);
                 painter.rect_filled(slot, 8.0, theme().surface);
-                let text = if failed { "PDF illisible" } else { "…" };
+                let text = if failed { "Fichier illisible" } else { "…" };
                 painter.text(
                     slot.center(),
                     Align2::CENTER_CENTER,
@@ -2032,11 +2395,18 @@ impl App {
             let fill = Color32::from_black_alpha(200);
             at.x = widgets::badge(&painter, at, "Terminé", fill, Color32::WHITE).right() + 6.0;
         }
-        if pos.manga {
+        // Le rayon d'un album trouvé par la recherche, s'il n'est pas celui ouvert.
+        let kind = self.state.kind(path);
+        if kind != self.state.shelf {
+            let name = match kind {
+                Kind::Bd => "BD",
+                Kind::Manga => "Manga",
+                Kind::Livre => "Livre",
+            };
             widgets::badge(
                 &painter,
                 at,
-                "Manga",
+                name,
                 Color32::from_black_alpha(200),
                 Color32::WHITE,
             );
@@ -2075,12 +2445,7 @@ impl App {
             painter.text(
                 pos2(rect.left(), slot.bottom() + 14.0 + title_h),
                 Align2::LEFT_TOP,
-                format!(
-                    "Page {} / {}   ·   {}",
-                    pos.rank(pos.page) + 1,
-                    pos.pages,
-                    percent(pos.progress)
-                ),
+                where_at(path, &pos),
                 FontId::proportional(11.5),
                 theme().muted,
             );
@@ -2133,14 +2498,16 @@ impl App {
         };
         let width = (ctx.content_rect().width() - 96.0).clamp(300.0, 760.0);
         let finished = self.state.position(&path).finished();
+        let kindle_ok = crate::kindle::refusal(&path).is_none();
         enum Do {
             Nothing,
             Read,
             MarkRead(bool),
             Edit,
-            Search(Guess, bool),
+            Search(Guess, Kind),
             Forget,
             Again,
+            Kindle,
         }
         let mut action = Do::Nothing;
         let frame = egui::Frame::new()
@@ -2153,177 +2520,210 @@ impl App {
             .backdrop_color(Color32::from_black_alpha(170))
             .show(ctx, |ui| {
                 ui.set_width(width);
-                ui.horizontal_top(|ui| {
-                    if let Some(t) = &cover {
-                        let size = t.size_vec2();
-                        let w = (width * 0.26).min(180.0);
-                        ui.add(
-                            egui::Image::from_texture((t.id(), vec2(w, w * size.y / size.x)))
-                                .corner_radius(8.0),
-                        );
-                        ui.add_space(22.0);
-                    }
-                    ui.vertical(|ui| {
-                        if let Some(series) = &info.series {
-                            let text = match info.volume {
-                                Some(v) => format!("{series}  ·  Tome {v}"),
-                                None => series.clone(),
-                            };
-                            ui.label(egui::RichText::new(text).size(13.0).strong().color(theme().accent));
-                        }
-                        let name = info.title.clone().unwrap_or_else(|| title(&path));
-                        ui.label(egui::RichText::new(name).size(24.0).strong().color(theme().text));
-                        ui.add_space(6.0);
-                        if !info.authors.is_empty() {
-                            ui.label(egui::RichText::new(info.credits()).size(14.0).color(theme().text));
-                        }
-                        let facts: Vec<String> = [
-                            info.publisher.clone(),
-                            info.year.map(|y| y.to_string()),
-                            info.pages.map(|p| format!("{p} pages")),
-                            info.isbn.as_ref().map(|i| format!("ISBN {i}")),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                        if !facts.is_empty() {
-                            ui.label(egui::RichText::new(facts.join("   ·   ")).color(theme().muted));
-                        }
-                        if !info.genres.is_empty() {
-                            ui.label(
-                                egui::RichText::new(info.genres.join(", "))
-                                    .size(12.5)
-                                    .color(theme().muted),
+                // Toute la fiche défile, seulement si l'écran est trop petit.
+                let room = (ctx.content_rect().height() - 140.0).max(240.0);
+                egui::ScrollArea::vertical()
+                    .max_height(room)
+                    .min_scrolled_height(room)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        if let Some(t) = &cover {
+                            let size = t.size_vec2();
+                            let w = (width * 0.26).min(180.0);
+                            ui.add(
+                                egui::Image::from_texture((t.id(), vec2(w, w * size.y / size.x)))
+                                    .corner_radius(8.0),
                             );
+                            ui.add_space(22.0);
                         }
-                        ui.add_space(8.0);
-                        if pending {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(egui::RichText::new("Recherche en ligne…").color(theme().muted));
-                            });
-                        } else if !info.searched {
-                            ui.label(
-                                egui::RichText::new(
-                                    "Hors ligne : infos tirées du nom du fichier. \
-                                     Nouvel essai au prochain lancement.",
-                                )
-                                .color(theme().muted),
-                            );
-                        } else if info.sources.is_empty() {
-                            ui.label(
-                                egui::RichText::new(
-                                    "Rien trouvé en ligne. Corrige la série ou le titre \
-                                     pour aider la recherche.",
-                                )
-                                .color(theme().muted),
-                            );
-                        }
-                        ui.add_space(14.0);
-                        if draft.is_none() {
-                            ui.horizontal(|ui| {
-                                if widgets::button(ui, Some(Icon::Play), "Lire", Tone::Primary)
-                                    .clicked()
-                                {
-                                    action = Do::Read;
-                                }
-                                let (label, read) = if finished {
-                                    ("Marquer comme non lu", false)
-                                } else {
-                                    ("Marquer comme lu", true)
+                        ui.vertical(|ui| {
+                            if let Some(series) = &info.series {
+                                let text = match info.volume {
+                                    Some(v) => format!("{series}  ·  Tome {v}"),
+                                    None => series.clone(),
                                 };
-                                if widgets::button(ui, None, label, Tone::Plain).clicked() {
-                                    action = Do::MarkRead(read);
-                                }
-                                if widgets::button(ui, None, "Corriger", Tone::Plain)
-                                    .on_hover_text("Série, tome, titre ou auteurs mal reconnus")
-                                    .clicked()
-                                {
-                                    action = Do::Edit;
-                                }
-                                if widgets::button(ui, None, "Chercher à nouveau", Tone::Plain)
-                                    .clicked()
-                                {
-                                    action = Do::Again;
-                                }
-                            });
-                        }
-                    });
-                });
-
-                ui.add_space(20.0);
-                if let Some(d) = &mut draft {
-                    ui.label(
-                        egui::RichText::new("Corriger les infos")
-                            .size(16.0)
-                            .strong()
-                            .color(theme().text),
-                    );
-                    ui.label(
-                        egui::RichText::new("La recherche en ligne repartira de ce que tu indiques.")
-                            .color(theme().muted),
-                    );
-                    ui.add_space(10.0);
-                    egui::Grid::new("correction")
-                        .num_columns(2)
-                        .spacing([14.0, 10.0])
-                        .show(ui, |ui| {
-                            for (name, value, hint) in [
-                                ("Série", &mut d.series, "Lanfeust de Troy"),
-                                ("Tome", &mut d.volume, "2"),
-                                ("Titre", &mut d.title, "Thanos l'incongru"),
-                                ("Auteurs", &mut d.authors, "séparés par des virgules"),
-                            ] {
-                                ui.label(egui::RichText::new(name).color(theme().muted));
-                                ui.add(
-                                    egui::TextEdit::singleline(value)
-                                        .hint_text(hint)
-                                        .desired_width(width * 0.6),
+                                ui.label(egui::RichText::new(text).size(13.0).strong().color(theme().accent));
+                            }
+                            let name = info.title.clone().unwrap_or_else(|| title(&path));
+                            ui.label(egui::RichText::new(name).size(24.0).strong().color(theme().text));
+                            ui.add_space(6.0);
+                            if !info.authors.is_empty() {
+                                ui.label(egui::RichText::new(info.credits()).size(14.0).color(theme().text));
+                            }
+                            let facts: Vec<String> = [
+                                info.publisher.clone(),
+                                info.year.map(|y| y.to_string()),
+                                info.pages.map(|p| format!("{p} pages")),
+                                info.isbn.as_ref().map(|i| format!("ISBN {i}")),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                            if !facts.is_empty() {
+                                ui.label(egui::RichText::new(facts.join("   ·   ")).color(theme().muted));
+                            }
+                            if !info.genres.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(info.genres.join(", "))
+                                        .size(12.5)
+                                        .color(theme().muted),
                                 );
-                                ui.end_row();
                             }
-                            ui.label(egui::RichText::new("Genre").color(theme().muted));
-                            ui.horizontal(|ui| {
-                                ui.radio_value(&mut d.manga, false, "BD");
-                                ui.radio_value(&mut d.manga, true, "Manga")
-                                    .on_hover_text("Cherché aussi sur AniList, lu de droite à gauche");
-                            });
-                            ui.end_row();
+                            ui.add_space(8.0);
+                            if pending {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(egui::RichText::new("Recherche en ligne…").color(theme().muted));
+                                });
+                            } else if !info.searched {
+                                ui.label(
+                                    egui::RichText::new(
+                                        if serj::ebook::is_ebook(&path) {
+                                            "Hors ligne : infos tirées du livre lui-même. \
+                                             Nouvel essai au prochain lancement."
+                                        } else {
+                                            "Hors ligne : infos tirées du nom du fichier. \
+                                             Nouvel essai au prochain lancement."
+                                        },
+                                    )
+                                    .color(theme().muted),
+                                );
+                            } else if info.sources.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Rien trouvé en ligne. Corrige la série ou le titre \
+                                         pour aider la recherche.",
+                                    )
+                                    .color(theme().muted),
+                                );
+                            }
+                            ui.add_space(14.0);
+                            if draft.is_none() {
+                                ui.horizontal(|ui| {
+                                    if widgets::button(ui, Some(Icon::Play), "Lire", Tone::Primary)
+                                        .clicked()
+                                    {
+                                        action = Do::Read;
+                                    }
+                                    let (label, read) = if finished {
+                                        ("Marquer comme non lu", false)
+                                    } else {
+                                        ("Marquer comme lu", true)
+                                    };
+                                    if widgets::button(ui, None, label, Tone::Plain).clicked() {
+                                        action = Do::MarkRead(read);
+                                    }
+                                    if widgets::button(ui, None, "Corriger", Tone::Plain)
+                                        .on_hover_text("Série, tome, titre ou auteurs mal reconnus")
+                                        .clicked()
+                                    {
+                                        action = Do::Edit;
+                                    }
+                                    if widgets::button(ui, None, "Chercher à nouveau", Tone::Plain)
+                                        .clicked()
+                                    {
+                                        action = Do::Again;
+                                    }
+                                    if kindle_ok
+                                        && widgets::button(ui, Some(Icon::Send), "Kindle", Tone::Plain)
+                                            .on_hover_text("Envoyer vers ma Kindle")
+                                            .clicked()
+                                    {
+                                        action = Do::Kindle;
+                                    }
+                                });
+                                // Les résumés à côté de la couverture, en entier.
+                                ui.add_space(22.0);
+                                if let Some(text) = &info.summary {
+                                    prose(ui, "Résumé", text);
+                                    ui.add_space(14.0);
+                                }
+                                // La présentation de la série, ou du livre seul.
+                                let heading = if info.series.is_some() {
+                                    "La série"
+                                } else {
+                                    "Présentation"
+                                };
+                                match (&info.series_summary, pending) {
+                                    (Some(text), _) => prose(ui, heading, text),
+                                    (None, true) => prose(ui, heading, "…"),
+                                    (None, false) => {}
+                                }
+                            }
                         });
-                    ui.add_space(14.0);
-                    ui.horizontal(|ui| {
-                        if widgets::button(ui, None, "Chercher", Tone::Primary).clicked() {
-                            action = Do::Search(d.guess(), d.manga);
-                        }
-                        if widgets::button(ui, None, "Annuler", Tone::Plain).clicked() {
-                            action = Do::Edit;
-                        }
-                        if widgets::button(ui, None, "Revenir au nom du fichier", Tone::Plain)
-                            .clicked()
-                        {
-                            action = Do::Forget;
-                        }
                     });
-                } else {
-                    egui::ScrollArea::vertical()
-                        .max_height((ctx.content_rect().height() - 420.0).max(160.0))
-                        .show(ui, |ui| {
-                            match (&info.series_summary, pending) {
-                                (Some(text), _) => prose(ui, "La série", text),
-                                (None, true) => prose(ui, "La série", "…"),
-                                (None, false) => {}
-                            }
-                        });
-                    if !info.sources.is_empty() {
+
+                    ui.add_space(20.0);
+                    if let Some(d) = &mut draft {
+                        ui.label(
+                            egui::RichText::new("Corriger les infos")
+                                .size(16.0)
+                                .strong()
+                                .color(theme().text),
+                        );
+                        ui.label(
+                            egui::RichText::new("La recherche en ligne repartira de ce que tu indiques.")
+                                .color(theme().muted),
+                        );
+                        ui.add_space(10.0);
+                        egui::Grid::new("correction")
+                            .num_columns(2)
+                            .spacing([14.0, 10.0])
+                            .show(ui, |ui| {
+                                for (name, value, hint) in [
+                                    ("Série", &mut d.series, "Lanfeust de Troy"),
+                                    ("Tome", &mut d.volume, "2"),
+                                    ("Titre", &mut d.title, "Thanos l'incongru"),
+                                    ("Auteurs", &mut d.authors, "séparés par des virgules"),
+                                ] {
+                                    ui.label(egui::RichText::new(name).color(theme().muted));
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .hint_text(hint)
+                                            .desired_width(width * 0.6),
+                                    );
+                                    ui.end_row();
+                                }
+                                // Un livre en texte reste un livre.
+                                if !serj::ebook::is_ebook(&path) {
+                                    ui.label(egui::RichText::new("Rayon").color(theme().muted));
+                                    ui.horizontal(|ui| {
+                                        ui.radio_value(&mut d.kind, Kind::Bd, "BD");
+                                        ui.radio_value(&mut d.kind, Kind::Manga, "Manga")
+                                            .on_hover_text("Cherché aussi sur AniList, lu de droite à gauche");
+                                        ui.radio_value(&mut d.kind, Kind::Livre, "Livre")
+                                            .on_hover_text("Un roman, un essai : lu page par page");
+                                    });
+                                    ui.end_row();
+                                }
+                            });
                         ui.add_space(14.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new("Sources :").size(12.0).color(theme().muted));
-                            for (name, url) in &info.sources {
-                                ui.hyperlink_to(egui::RichText::new(name).size(12.0), url);
+                        ui.horizontal(|ui| {
+                            if widgets::button(ui, None, "Chercher", Tone::Primary).clicked() {
+                                action = Do::Search(d.guess(), d.kind);
+                            }
+                            if widgets::button(ui, None, "Annuler", Tone::Plain).clicked() {
+                                action = Do::Edit;
+                            }
+                            if widgets::button(ui, None, "Revenir au nom du fichier", Tone::Plain)
+                                .clicked()
+                            {
+                                action = Do::Forget;
                             }
                         });
+                    } else {
+                        if !info.sources.is_empty() {
+                            ui.add_space(14.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new("Sources :").size(12.0).color(theme().muted));
+                                for (name, url) in &info.sources {
+                                    ui.hyperlink_to(egui::RichText::new(name).size(12.0), url);
+                                }
+                            });
+                        }
                     }
-                }
+                    });
             });
 
         let correction = self.state.correction(&path).cloned();
@@ -2347,12 +2747,10 @@ impl App {
                 self.state.set_position(&path, pos);
                 self.state.save();
             }
-            Do::Search(guess, manga) => {
+            Do::Search(guess, kind) => {
                 self.state.set_correction(&path, Some(guess));
-                let mut pos = self.state.position(&path);
-                if pos.manga != manga {
-                    pos.set_manga(manga);
-                    self.state.set_position(&path, pos);
+                if kind != self.state.kind(&path) {
+                    self.state.set_kind(&path, kind);
                 }
                 self.state.save();
                 draft = None;
@@ -2362,7 +2760,11 @@ impl App {
                 self.state.save();
                 draft = None;
             }
-            Do::Again => self.infos.refresh(&path, manga, correction.as_ref()),
+            Do::Kindle => self.send_to_kindle(&path),
+            Do::Again => {
+                let livre = self.state.kind(&path) == Kind::Livre;
+                self.infos.refresh(&path, manga, livre, correction.as_ref());
+            }
         }
         if modal.should_close() && draft.is_none() {
             self.sheet = None;
@@ -2371,8 +2773,42 @@ impl App {
         }
     }
 
+    /// La lecture d'un livre en texte (`reader`).
+    fn reading_text(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, now: f64) {
+        let path = self.text.as_ref().expect("livre ouvert").path.clone();
+        let name = self.label(&path);
+        if name != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Serj")));
+            self.window_title = name.clone();
+        }
+        let text = self.text.as_mut().expect("livre ouvert");
+        text.advance |= std::mem::take(&mut self.auto_next);
+        let mut typography = self.state.typography;
+        let mut hud_until = self.hud_until;
+        let out = self.text.as_mut().expect("livre ouvert").show(
+            ui,
+            area,
+            now,
+            &mut typography,
+            &mut hud_until,
+            &name,
+        );
+        self.hud_until = hud_until;
+        self.state.typography = typography;
+        if out.changed {
+            self.state_dirty_since.get_or_insert(now);
+        }
+        if out.fullscreen {
+            let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+        }
+        if out.close {
+            self.close(ctx);
+        }
+    }
+
     fn reading(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, area: Rect, now: f64) {
-        let whole_page = self.state.whole_page;
+        let whole_page = self.whole_page();
         self.book
             .as_mut()
             .expect("album ouvert")
@@ -2480,7 +2916,7 @@ impl App {
             self.hud_until = self.hud_until.max(now + 1.0);
         }
 
-        let whole_page = self.state.whole_page;
+        let whole_page = self.whole_page();
         let book = self.book.as_mut().expect("album ouvert");
         // La dernière case de la page précédente, une fois celle-ci rendue.
         if book.to_last_panel
@@ -2488,6 +2924,19 @@ impl App {
         {
             book.position.panel = n - 1;
             book.to_last_panel = false;
+        }
+        // La page qui tourne (un livre), une fois la nouvelle rendue.
+        let turn = match &mut book.turn {
+            Some(t) if book.pages.contains_key(&book.position.page) => {
+                let start = *t.start.get_or_insert(now);
+                let part = ((now - start) / TURN_SECS) as f32;
+                (part < 1.0).then_some((t.from, t.forward, part))
+            }
+            Some(_) => Some((usize::MAX, true, 0.0)),
+            None => None,
+        };
+        if turn.is_none() {
+            book.turn = None;
         }
 
         let painter = ui.painter_at(area);
@@ -2562,7 +3011,32 @@ impl App {
             let page_rect =
                 Rect::from_min_max(to_screen(Pos2::ZERO), to_screen(page.size.to_pos2()));
             let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-            painter.image(page.texture.id(), page_rect, uv, Color32::WHITE);
+            match turn {
+                Some((from, forward, t)) => {
+                    // L'ancienne page s'efface vite en reculant un peu ; la
+                    // nouvelle arrive de l'autre côté.
+                    let ease = 1.0 - (1.0 - t).powi(3);
+                    let dir = if forward { 1.0 } else { -1.0 };
+                    if let Some(old) = book.pages.get(&from) {
+                        let fit = (room.width() / old.size.x).min(room.height() / old.size.y);
+                        let r = Rect::from_center_size(area.center(), old.size * fit)
+                            .translate(vec2(-dir * TURN_SHIFT * ease, 0.0));
+                        let fade = (1.0 - ease * 1.6).max(0.0);
+                        painter.image(old.texture.id(), r, uv, Color32::WHITE.gamma_multiply(fade));
+                    }
+                    let r = page_rect.translate(vec2(dir * TURN_SHIFT * (1.0 - ease), 0.0));
+                    painter.image(
+                        page.texture.id(),
+                        r,
+                        uv,
+                        Color32::WHITE.gamma_multiply(ease),
+                    );
+                    ctx.request_repaint();
+                }
+                None => {
+                    painter.image(page.texture.id(), page_rect, uv, Color32::WHITE);
+                }
+            }
             if !whole_page {
                 // Le reste de la planche, assombri autour de la case.
                 let hole = Rect::from_min_max(to_screen(camera.min), to_screen(camera.max));
@@ -2735,7 +3209,7 @@ impl App {
         let compact = area.width() < 820.0;
         let label = |full: &'static str| if compact { "" } else { full };
         let tone = |on: bool| if on { Tone::Active } else { Tone::Plain };
-        let whole_page = self.state.whole_page;
+        let whole_page = self.whole_page();
         let manga = book.position.manga;
         let mut hovered = false;
 
@@ -2756,24 +3230,28 @@ impl App {
                     .on_hover_text("Plein écran (F)")
                     .clicked();
                 ui.add_space(10.0);
-                a.toggle_manga = widgets::button(
-                    ui,
-                    Some(Icon::RightToLeft),
-                    label("Manga"),
-                    tone(manga),
-                )
-                .on_hover_text(
-                    "Manga : de la dernière page à la première, cases de droite à gauche (M)",
-                )
-                .clicked();
-                ui.add_space(10.0);
-                let page = widgets::button(ui, Some(Icon::Page), label("Page"), tone(whole_page))
-                    .on_hover_text("Page entière (P)");
-                let panels =
-                    widgets::button(ui, Some(Icon::Panels), label("Cases"), tone(!whole_page))
-                        .on_hover_text("Case par case (P)");
-                a.toggle_page = (page.clicked() && !whole_page) || (panels.clicked() && whole_page);
-                ui.add_space(10.0);
+                if !book.livre {
+                    a.toggle_manga = widgets::button(
+                        ui,
+                        Some(Icon::RightToLeft),
+                        label("Manga"),
+                        tone(manga),
+                    )
+                    .on_hover_text(
+                        "Manga : de la dernière page à la première, cases de droite à gauche (M)",
+                    )
+                    .clicked();
+                    ui.add_space(10.0);
+                    let page =
+                        widgets::button(ui, Some(Icon::Page), label("Page"), tone(whole_page))
+                            .on_hover_text("Page entière (P)");
+                    let panels =
+                        widgets::button(ui, Some(Icon::Panels), label("Cases"), tone(!whole_page))
+                            .on_hover_text("Case par case (P)");
+                    a.toggle_page =
+                        (page.clicked() && !whole_page) || (panels.clicked() && whole_page);
+                    ui.add_space(10.0);
+                }
                 a.slower = widgets::button(ui, Some(Icon::Plus), "", Tone::Plain)
                     .on_hover_text("Plus de temps par case (+)")
                     .clicked();
@@ -2871,7 +3349,7 @@ impl App {
     }
 
     fn apply(&mut self, ctx: &egui::Context, a: Actions, now: f64) {
-        let whole_page = self.state.whole_page;
+        let whole_page = self.whole_page();
         let Some(book) = self.book.as_mut() else {
             return;
         };
@@ -2893,16 +3371,25 @@ impl App {
         if let Some(page) = a.jump {
             book.go_to_page(page, whole_page);
         }
-        if a.toggle_page {
+        if a.toggle_page && !book.livre {
             self.state.whole_page = !whole_page;
             if let Some(here) = book.camera(now, whole_page) {
                 book.glide(From::Rect(here), MOVE_SECS);
             }
         }
-        if a.toggle_manga {
-            book.set_manga(!book.position.manga, now, self.state.whole_page);
+        if a.toggle_manga && !book.livre {
+            book.set_manga(!book.position.manga, now, whole_page);
         }
         let moved = book.position.page != before.page || book.position.panel != before.panel;
+        // Un livre : la page quittée s'efface pendant que la nouvelle arrive.
+        if book.livre && book.position.page != before.page && !a.auto {
+            let jumped = a.jump.is_some() || a.first || a.last;
+            book.turn = (!jumped && book.pages.contains_key(&before.page)).then(|| PageTurn {
+                from: before.page,
+                forward: book.position.rank(book.position.page) > book.position.rank(before.page),
+                start: None,
+            });
+        }
         if moved {
             self.auto_since = None;
         }
@@ -2965,6 +3452,113 @@ impl Actions {
     }
 }
 
+/// Les rayons, dans l'ordre des onglets.
+const SHELVES: [Kind; 3] = [Kind::Bd, Kind::Manga, Kind::Livre];
+
+/// « 1 album », « 3 tomes », « 2 livres », selon le rayon.
+fn noun(kind: Kind, n: usize) -> String {
+    match kind {
+        Kind::Bd => plural(n, "album", "albums"),
+        Kind::Manga => plural(n, "tome", "tomes"),
+        Kind::Livre => plural(n, "livre", "livres"),
+    }
+}
+
+/// Les onglets des rayons, en pilules avec leur compte ; renvoie celui qu'on
+/// choisit.
+fn shelf_tabs(ui: &mut egui::Ui, current: Kind, counts: [usize; 3]) -> Option<Kind> {
+    let mut chosen = None;
+    let t = theme();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        for (kind, count) in SHELVES.into_iter().zip(counts) {
+            let name = match kind {
+                Kind::Bd => "BD",
+                Kind::Manga => "Mangas",
+                Kind::Livre => "Livres",
+            };
+            let on = kind == current;
+            let label = ui.painter().layout_no_wrap(
+                name.to_string(),
+                FontId::proportional(15.5),
+                if on { t.on_accent } else { t.text },
+            );
+            let number = ui.painter().layout_no_wrap(
+                count.to_string(),
+                FontId::proportional(12.0),
+                if on {
+                    t.on_accent.gamma_multiply(0.75)
+                } else {
+                    t.muted
+                },
+            );
+            let size = vec2(label.size().x + number.size().x + 44.0, 38.0);
+            let (r, response) = ui.allocate_exact_size(size, Sense::click());
+            let hover = ui
+                .ctx()
+                .animate_bool_with_time(response.id, response.hovered(), 0.12);
+            let fill = if on {
+                t.accent
+            } else {
+                t.surface.lerp_to_gamma(t.raised(), hover)
+            };
+            ui.painter().rect_filled(r, 19.0, fill);
+            let x = r.left() + 18.0;
+            ui.painter().galley(
+                pos2(x, r.center().y - label.size().y / 2.0),
+                label.clone(),
+                t.text,
+            );
+            ui.painter().galley(
+                pos2(
+                    x + label.size().x + 8.0,
+                    r.center().y - number.size().y / 2.0 + 1.0,
+                ),
+                number,
+                t.muted,
+            );
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.clicked() && !on {
+                chosen = Some(kind);
+            }
+        }
+    });
+    chosen
+}
+
+/// Un rayon vide : ce qu'on peut y mettre.
+fn empty_shelf(ui: &mut egui::Ui, kind: Kind) {
+    let (title, hint) = match kind {
+        Kind::Bd => (
+            "Pas encore de BD",
+            "Ajoute des BD en PDF, CBZ ou CBR : Serj les lit case par case.",
+        ),
+        Kind::Manga => (
+            "Pas encore de manga",
+            "Range un album ici d'un clic droit (« Ranger dans »), ou corrige sa fiche : \
+             il se lira de droite à gauche.",
+        ),
+        Kind::Livre => (
+            "Pas encore de livre",
+            "Ajoute des romans en EPUB, MOBI, AZW3, FB2, TXT ou PDF : Serj les met en page \
+             et tu tournes les pages.",
+        ),
+    };
+    ui.add_space(70.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new(title)
+                .size(19.0)
+                .strong()
+                .color(theme().text),
+        );
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(hint).color(theme().muted));
+    });
+}
+
 /// L'accueil sans aucun album.
 fn empty_library(ui: &mut egui::Ui) {
     ui.add_space(90.0);
@@ -2983,7 +3577,8 @@ fn empty_library(ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
-                "Ajoute tes BD (des PDF ou les dossiers où elles sont), ou glisse-les dans la fenêtre.",
+                "Ajoute tes BD, mangas et livres (PDF, CBZ, CBR, EPUB, MOBI, FB2, TXT…) ou les \
+                 dossiers où ils sont, ou glisse-les dans la fenêtre.",
             )
             .color(theme().muted),
         );
@@ -3002,7 +3597,13 @@ impl Draft {
                 .map(|a| a.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            manga: info.manga,
+            kind: if info.livre {
+                Kind::Livre
+            } else if info.manga {
+                Kind::Manga
+            } else {
+                Kind::Bd
+            },
         }
     }
 
@@ -3243,10 +3844,224 @@ fn size(bytes: u64) -> String {
     }
 }
 
+/// Où on en est : « Page 12 / 48 · 25 % », ou « 25 % lus » pour un livre en
+/// texte (ses pages changent avec la taille du texte).
+fn where_at(path: &Path, pos: &Position) -> String {
+    if serj::ebook::is_ebook(path) {
+        format!("{} lus", percent(pos.progress))
+    } else {
+        format!(
+            "Page {} / {}   ·   {}",
+            pos.rank(pos.page) + 1,
+            pos.pages,
+            percent(pos.progress)
+        )
+    }
+}
+
+/// La couverture d'un livre qui n'en a pas : son titre et son auteur, sur
+/// un aplat de l'accent, comme une collection de poche.
+fn generated_cover(painter: &egui::Painter, rect: Rect, info: &Info, path: &Path) {
+    let t = theme();
+    painter.rect_filled(rect, 8.0, t.accent.lerp_to_gamma(t.background, 0.35));
+    let inner = rect.shrink(rect.width() * 0.1);
+    painter.rect_stroke(
+        inner,
+        2.0,
+        egui::Stroke::new(1.0, t.on_accent.gamma_multiply(0.4)),
+        egui::StrokeKind::Inside,
+    );
+    let width = inner.width() * 0.86;
+    let name = info.title.clone().unwrap_or_else(|| title(path));
+    let mut job = egui::text::LayoutJob::simple(
+        name,
+        FontId::new(
+            rect.width() * 0.11,
+            egui::FontFamily::Name("serif-bold".into()),
+        ),
+        t.on_accent,
+        width,
+    );
+    job.halign = egui::Align::Center;
+    job.wrap.max_rows = 5;
+    let galley = painter.layout_job(job);
+    painter.galley(
+        pos2(inner.center().x, inner.top() + inner.height() * 0.22),
+        galley,
+        t.on_accent,
+    );
+    if let Some(author) = info.authors.first() {
+        let mut job = egui::text::LayoutJob::simple(
+            author.name.clone(),
+            FontId::new(
+                rect.width() * 0.07,
+                egui::FontFamily::Name("serif-italic".into()),
+            ),
+            t.on_accent.gamma_multiply(0.85),
+            width,
+        );
+        job.halign = egui::Align::Center;
+        job.wrap.max_rows = 2;
+        let galley = painter.layout_job(job);
+        painter.galley(
+            pos2(
+                inner.center().x,
+                inner.bottom() - inner.height() * 0.12 - galley.size().y,
+            ),
+            galley,
+            t.on_accent,
+        );
+    }
+}
+
 fn percent(progress: f32) -> String {
     format!("{} %", (progress * 100.0).floor() as u32)
 }
 
-pub fn is_pdf(p: &Path) -> bool {
+fn is_pdf(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rend l'accueil en images, sans fenêtre, avec la bibliothèque de `HOME`
+    /// (à faire pointer ailleurs que la vraie) :
+    /// `HOME=dossier SERJ_RENDU=sortie cargo test --release --bin serj rend_l_accueil`.
+    #[test]
+    fn rend_l_accueil() {
+        let Some(out) = std::env::var_os("SERJ_RENDU") else {
+            return;
+        };
+        let out = PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(1400.0, 900.0))
+            .with_step_dt(1.0 / 30.0)
+            .wgpu()
+            .build_eframe(|cc| {
+                let mut app = App::new(cc, None);
+                app.splash = None;
+                app
+            });
+        // Un livre à ouvrir : quelques pages, et une page qui tourne.
+        if let Some(book) = std::env::var_os("SERJ_OUVRIR") {
+            let path = PathBuf::from(book);
+            for _ in 0..40 {
+                harness.step();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let ctx = harness.ctx.clone();
+            harness.state_mut().open(&ctx, path);
+            for n in 0..3 {
+                for _ in 0..40 {
+                    harness.step();
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                harness
+                    .render()
+                    .unwrap()
+                    .save(out.join(format!("lecture{n}.png")))
+                    .unwrap();
+                harness.key_press(Key::ArrowRight);
+                harness.step();
+                harness.step();
+                harness.step();
+                harness.step();
+                harness
+                    .render()
+                    .unwrap()
+                    .save(out.join(format!("lecture{n}-tourne.png")))
+                    .unwrap();
+            }
+            return;
+        }
+        // Les réglages, chaque onglet ; avec SERJ_KINDLE, un vrai envoi du
+        // premier livre (vers le serveur des réglages de `HOME`) d'abord.
+        if std::env::var_os("SERJ_REGLAGES").is_some() {
+            harness.state_mut().state.shelf = Kind::Livre;
+            for _ in 0..30 {
+                harness.step();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if std::env::var_os("SERJ_KINDLE").is_some() {
+                let book = harness
+                    .state()
+                    .books
+                    .iter()
+                    .find(|p| crate::kindle::accepted(p))
+                    .cloned()
+                    .expect("un livre à envoyer");
+                harness.state_mut().send_to_kindle(&book);
+                harness
+                    .render()
+                    .unwrap()
+                    .save(out.join("envoi.png"))
+                    .unwrap();
+                for _ in 0..30 {
+                    harness.step();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                harness
+                    .render()
+                    .unwrap()
+                    .save(out.join("envoye.png"))
+                    .unwrap();
+            }
+            for (tab, name) in [
+                (crate::settings::Tab::General, "general"),
+                (crate::settings::Tab::Kindle, "kindle"),
+                (crate::settings::Tab::About, "apropos"),
+            ] {
+                let window = crate::settings::Window::new(&harness.state().state, tab);
+                harness.state_mut().settings = Some(window);
+                for _ in 0..10 {
+                    harness.step();
+                }
+                harness
+                    .render()
+                    .unwrap()
+                    .save(out.join(format!("reglages-{name}.png")))
+                    .unwrap();
+            }
+            return;
+        }
+        // La fiche d'un album de la bibliothèque.
+        if let Some(path) = std::env::var_os("SERJ_FICHE") {
+            harness.state_mut().state.shelf = Kind::Livre;
+            for _ in 0..40 {
+                harness.step();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let path = harness
+                .state()
+                .books
+                .iter()
+                .find(|p| p.file_name() == PathBuf::from(&path).file_name())
+                .cloned()
+                .unwrap_or(PathBuf::from(path));
+            harness.state_mut().sheet = Some(Sheet { path, draft: None });
+            for _ in 0..40 {
+                harness.step();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            harness
+                .render()
+                .unwrap()
+                .save(out.join("fiche.png"))
+                .unwrap();
+            return;
+        }
+        for shelf in SHELVES {
+            harness.state_mut().state.shelf = shelf;
+            // Le temps que les couvertures et les infos arrivent.
+            for _ in 0..60 {
+                harness.step();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let name = format!("accueil-{shelf:?}.png").to_lowercase();
+            harness.render().unwrap().save(out.join(name)).unwrap();
+        }
+    }
 }

@@ -3,8 +3,11 @@
 mod about;
 mod app;
 mod infos;
+mod kindle;
 mod library;
 mod loader;
+mod reader;
+mod settings;
 mod shots;
 mod splash;
 mod state;

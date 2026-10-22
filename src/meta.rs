@@ -81,6 +81,10 @@ pub struct Info {
     pub searched: bool,
     /// Pour un manga (AniList), ou une BD.
     pub manga: bool,
+    /// Pour un livre (un roman, un essai…) : cherché comme tel.
+    pub livre: bool,
+    /// Le résumé du livre, tel qu'il le donne lui-même (EPUB, FB2…).
+    pub summary: Option<String>,
     /// La recherche qui a donné ces infos, pour savoir s'il faut la refaire.
     pub query: Guess,
     /// La version de la recherche ([`INFO_FORMAT`]) : une plus ancienne est
@@ -89,8 +93,9 @@ pub struct Info {
 }
 
 /// Augmenté quand la recherche trouve de nouvelles infos (1 : le nombre de
-/// tomes de la série).
-pub const INFO_FORMAT: u32 = 1;
+/// tomes de la série ; 2 : plus d'article sur une adaptation, film ou série
+/// télévisée, pour présenter la série).
+pub const INFO_FORMAT: u32 = 2;
 
 impl Info {
     pub fn from_guess(g: &Guess) -> Self {
@@ -112,8 +117,12 @@ impl Info {
         }
     }
 
-    /// « Lanfeust de Troy 2 · Thanos l'incongru », ou ce qu'on en sait.
+    /// « Lanfeust de Troy 2 · Thanos l'incongru », ou ce qu'on en sait. Un
+    /// livre a un vrai titre : il suffit.
     pub fn full_title(&self) -> Option<String> {
+        if self.livre && self.title.is_some() {
+            return self.title.clone();
+        }
         let series = self.series.as_ref().map(|s| match self.volume {
             Some(v) => format!("{s} {v}"),
             None => s.clone(),
@@ -500,7 +509,7 @@ struct Match {
     same: bool,
 }
 
-fn score(r: &Record, g: &Guess, manga: bool) -> Match {
+fn score(r: &Record, g: &Guess, manga: bool, livre: bool) -> Match {
     let (series, volume, title) = record_parts(&r.title);
     let whole = normalize(r.title.split(" / ").next().unwrap_or(&r.title));
     let mut score = 0.0;
@@ -543,7 +552,9 @@ fn score(r: &Record, g: &Guess, manga: bool) -> Match {
         .captures(format)
         .and_then(|c| c[1].parse::<u32>().ok())
         .is_some_and(|n| n > 1);
-    let novel = r.title.contains("texte de") || (!manga && pages.is_some_and(|p| p > 120));
+    // Un roman tiré de la BD (sauf si c'est un livre qu'on cherche).
+    let novel =
+        !livre && (r.title.contains("texte de") || (!manga && pages.is_some_and(|p| p > 120)));
     let ordinary = !novel
         && !several
         && !whole.contains("integrale")
@@ -573,9 +584,11 @@ fn year(r: &Record) -> Option<u32> {
 }
 
 /// La notice qui correspond le mieux à l'album, s'il y en a une assez proche.
-pub fn best_bnf(records: &[Record], g: &Guess, manga: bool) -> Option<Found> {
-    let mut scored: Vec<(Match, &Record)> =
-        records.iter().map(|r| (score(r, g, manga), r)).collect();
+pub fn best_bnf(records: &[Record], g: &Guess, manga: bool, livre: bool) -> Option<Found> {
+    let mut scored: Vec<(Match, &Record)> = records
+        .iter()
+        .map(|r| (score(r, g, manga, livre), r))
+        .collect();
     scored.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
     let (top, best) = scored.first()?;
     let best = *best;
@@ -643,6 +656,16 @@ pub fn infobox_volumes(wikitext: &str) -> Option<u32> {
         .captures(wikitext)
         .and_then(|c| c[1].parse().ok())
         .filter(|&n| n > 0)
+}
+
+/// Enlève la prononciation d'une introduction de Wikipédia (« Harry Potter
+/// [ʔaʁi pɔtœʁ] (en anglais : [ˈhæɹi ˈpɒtə]) est… ») : ses signes phonétiques
+/// ne sont pas dans les polices de Serj.
+pub fn without_pronunciation(s: &str) -> String {
+    static BRACKETS: LazyLock<Regex> = LazyLock::new(|| re(r"\s*\[[^\]\n]*\]"));
+    static EMPTY: LazyLock<Regex> = LazyLock::new(|| re(r"\s*\((?:en [^():]+\s*:\s*)?[,;\s]*\)"));
+    let s = BRACKETS.replace_all(s, "");
+    EMPTY.replace_all(&s, "").into_owned()
 }
 
 /// Enlève les balises HTML d'un texte (résumés d'AniList).
@@ -847,6 +870,7 @@ mod tests {
             &records,
             &guess("Lanfeust de Troy- Tome 2 - Thanos lincongru (Christophe Arleston, Didier Tarquin etc.)"),
             false,
+            false,
         )
         .expect("trouvé");
         assert_eq!(found.series.as_deref(), Some("Lanfeust de Troy"));
@@ -863,7 +887,17 @@ mod tests {
                 role: Some("Scénario".into())
             }
         );
-        assert!(best_bnf(&records, &guess("Blacksad - 03 - Ame rouge"), false).is_none());
+        assert!(best_bnf(&records, &guess("Blacksad - 03 - Ame rouge"), false, false).is_none());
+    }
+
+    #[test]
+    fn drops_pronunciations() {
+        assert_eq!(
+            without_pronunciation(
+                "Harry Potter [ʔaʁi pɔtœʁ] (en anglais : [ˈhæɹi ˈpɒtə]) est une série (de romans)."
+            ),
+            "Harry Potter est une série (de romans)."
+        );
     }
 
     #[test]
