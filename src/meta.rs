@@ -94,8 +94,9 @@ pub struct Info {
 
 /// Augmenté quand la recherche trouve de nouvelles infos (1 : le nombre de
 /// tomes de la série ; 2 : plus d'article sur une adaptation, film ou série
-/// télévisée, pour présenter la série).
-pub const INFO_FORMAT: u32 = 2;
+/// télévisée, pour présenter la série ; 3 : le nom de la série écrit comme
+/// Wikipédia, le même pour tous ses tomes).
+pub const INFO_FORMAT: u32 = 3;
 
 impl Info {
     pub fn from_guess(g: &Guess) -> Self {
@@ -216,6 +217,7 @@ pub fn guess(stem: &str) -> Guess {
     let stem = stem.replace('_', " ");
     let (main, groups) = split_groups(&stem);
     let mut g = Guess::default();
+    let downloaded = groups.iter().any(|group| is_source(group));
     for group in groups {
         if is_source(&group) {
             continue;
@@ -235,13 +237,29 @@ pub fn guess(stem: &str) -> Guess {
     match numbered(&main) {
         Some((series, volume, title)) if !series.is_empty() => {
             g.series = Some(series);
-            g.volume = Some(volume);
+            g.volume = Some(match unglue(volume) {
+                Some(v) if downloaded => v,
+                _ => volume,
+            });
             g.title = title;
         }
         _ if !main.is_empty() => g.title = Some(main),
         _ => {}
     }
     g
+}
+
+/// « Tome 512 » pour « Tome 5/12 » : les sites qui ôtent la barre (et se
+/// nomment entre parenthèses) collent le numéro au nombre de tomes. Le tome,
+/// s'il se lit ainsi (5 sur 12, 10 sur 12) ; sinon None (105 n'est pas 1/05).
+fn unglue(volume: u32) -> Option<u32> {
+    let digits = volume.to_string();
+    (1..digits.len()).find_map(|i| {
+        let (n, total) = digits.split_at(i);
+        let (n, total_n): (u32, u32) = (n.parse().ok()?, total.parse().ok()?);
+        (volume >= 100 && !total.starts_with('0') && (1..=total_n).contains(&n) && total_n <= 99)
+            .then_some(n)
+    })
 }
 
 /// Série, numéro, et ce qui suit (le titre de l'album).
@@ -326,6 +344,15 @@ fn tidy(s: &str) -> String {
             c == '-' || c == '–' || c == ':' || c == ',' || c == '.' || c.is_whitespace()
         })
         .to_string()
+}
+
+/// Sans les élisions collées des noms de fichiers (« lOiseau », « dEckmul »,
+/// « LOeuf ») : un catalogue ne connaît pas ces mots-là, il connaît « oiseau ».
+/// Un sigle (« DC », « TV ») reste tel quel.
+pub fn unglue_elisions(s: &str) -> String {
+    static GLUED: LazyLock<Regex> =
+        LazyLock::new(|| re(r"\b(?:[ldjmnstc]|qu)(\p{Lu})|\b(?:[LDJMNSTC]|Qu)(\p{Lu}\p{Ll})"));
+    GLUED.replace_all(s, "$1$2").into_owned()
 }
 
 /// Pour comparer des titres : minuscules, sans accents ni apostrophes (les noms
@@ -463,6 +490,14 @@ fn record_parts(title: &str) -> (Option<String>, Option<u32>, String) {
     let main = tidy(main);
     if let Some(caps) = NUMBERED.captures(&main) {
         let title = caps.get(3).map(|m| tidy(m.as_str())).unwrap_or_default();
+        // « La Quête de l'oiseau du temps : cycle de la quête : L'oeuf des
+        // ténèbres. 4 » : le titre est au bout de la série.
+        if title.is_empty()
+            && let Some((series, title)) = caps[1].split_once(" : ")
+        {
+            let title = title.rsplit(" : ").next().unwrap_or(title);
+            return (Some(tidy(series)), caps[2].parse().ok(), tidy(title));
+        }
         return (Some(tidy(&caps[1])), caps[2].parse().ok(), title);
     }
     // « Lanfeust de Troy : Thanos l'incongru », « One piece. Romance dawn ».
@@ -763,7 +798,53 @@ mod tests {
             guess("One Piece Vol.105"),
             g(Some("One Piece"), Some(105), None, &[])
         );
+        // « Tome 5/12 », la barre ôtée par le site.
+        assert_eq!(
+            guess(
+                "La Quête de lOiseau du Temps - Tome 512 - Lami Javin (Serge Le Tendre, Régis Loisel) (z-library.sk, 1lib.sk, z-lib.sk)"
+            ),
+            g(
+                Some("La Quête de lOiseau du Temps"),
+                Some(5),
+                Some("Lami Javin"),
+                &["Serge Le Tendre", "Régis Loisel"]
+            )
+        );
+        // Sans site dans le nom, un grand numéro reste tel quel.
+        assert_eq!(guess("Détective Conan - Tome 112").volume, Some(112));
+        assert_eq!(
+            guess("One Piece - Tome 105 (z-library.sk)").volume,
+            Some(105)
+        );
         assert_eq!(guess("Maus"), g(None, None, Some("Maus"), &[]));
+        assert_eq!(
+            unglue_elisions("La Quête de lOiseau du Temps, Paladin dEckmul"),
+            "La Quête de Oiseau du Temps, Paladin Eckmul"
+        );
+        assert_eq!(unglue_elisions("LOeuf des Ténèbres"), "Oeuf des Ténèbres");
+        assert_eq!(unglue_elisions("DC Comics, TV"), "DC Comics, TV");
+    }
+
+    #[test]
+    fn reads_bnf_titles() {
+        assert_eq!(
+            record_parts("Lanfeust de Troy. 2, Thanos l'incongru / scénario, Arleston"),
+            (
+                Some("Lanfeust de Troy".into()),
+                Some(2),
+                "Thanos l'incongru".into()
+            )
+        );
+        assert_eq!(
+            record_parts(
+                "La Quête de l'oiseau du temps : cycle de la quête : L'oeuf des ténèbres. 4 / scénario : Le Tendre"
+            ),
+            (
+                Some("La Quête de l'oiseau du temps".into()),
+                Some(4),
+                "L'oeuf des ténèbres".into()
+            )
+        );
     }
 
     #[test]

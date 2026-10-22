@@ -150,7 +150,12 @@ pub fn refusal(path: &Path) -> Option<String> {
 
 fn entry(settings: &Settings) -> Option<keyring::Entry> {
     let user = format!("{}@{}", settings.login(), settings.server.trim());
-    keyring::Entry::new("Serj (envoi vers la Kindle)", &user).ok()
+    // Pas le mot de passe de la version installée.
+    let service = match crate::dirs::DEV {
+        true => "Serj dev (envoi vers la Kindle)",
+        false => "Serj (envoi vers la Kindle)",
+    };
+    keyring::Entry::new(service, &user).ok()
 }
 
 pub fn password(settings: &Settings) -> Option<String> {

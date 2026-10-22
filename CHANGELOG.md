@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.0]
+
+- Une bulle ou un cartouche à cheval sur deux cases n'est plus coupé : chaque case qui en porte au moins le tiers le montre en entier.
+- Les pages de texte (crédits, listes de la collection) ne sont plus montrées entières, illisibles : elles se lisent par morceaux, colonne par colonne, assez grands pour lire. Une page de titre en gros caractères reste entière.
+- Le dossier de Serj est rangé par rayon : « BD », « Mangas » et « Livres », puis par série. La bibliothèque déjà là s'y range d'elle-même, et un album qui change de rayon change de dossier.
+- Une série porte le même nom pour tous ses tomes, écrit comme Wikipédia (accents, apostrophes, majuscules) ; les albums déjà là sont cherchés une fois de plus pour suivre.
+- Les noms de fichiers des sites de téléchargement : « Tome 512 » se lit « tome 5 sur 12 », et les apostrophes perdues (« lOiseau », « LOeuf ») ne font plus échouer la recherche à la BnF et sur Wikipédia. Les notices « … : cycle de la quête : L'oeuf des ténèbres. 4 » donnent leur titre.
+- Un album déplacé ou renommé hors de Serj est retrouvé au lancement, avec son avancement ; un fichier du dossier de Serj que la bibliothèque ne connaissait pas y entre.
+- Développement : `cargo run` garde ses réglages, ses albums et ses caches dans `dev-data/`, sans toucher à la bibliothèque de la version installée.
+
 ## [0.6.0]
 
 - Les livres : EPUB, MOBI, AZW3, FB2 et TXT (sans DRM), mis en page par Serj à la taille de la fenêtre — texte justifié, alinéas, titres de chapitre, images ; sur deux colonnes quand la fenêtre est large. On tourne les pages au clavier, au clic, à la molette ou en glissant la page, qui glisse un peu et se fond dans la suivante.

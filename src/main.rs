@@ -2,6 +2,7 @@
 
 mod about;
 mod app;
+mod dirs;
 mod infos;
 mod kindle;
 mod library;

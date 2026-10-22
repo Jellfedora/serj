@@ -262,6 +262,7 @@ impl App {
             books_at: None,
             detecting: HashSet::new(),
         };
+        app.recover();
         widgets::set_theme(&cc.egui_ctx, &app.state.theme);
         widgets::install_fonts(&cc.egui_ctx);
         // Le fichier passé en argument, sinon le dernier album lu (sauf pour
@@ -283,6 +284,67 @@ impl App {
             app.open(&cc.egui_ctx, path);
         }
         app
+    }
+
+    /// Le dossier de Serj fait foi : un album qu'on y croyait et qui n'y est
+    /// plus a été déplacé ou renommé (par Serj lui-même, une autre fenêtre de
+    /// Serj qui a réécrit l'ancienne liste, ou le Finder). On le retrouve,
+    /// sous le même nom ailleurs, sinon sous la même série et le même tome, et
+    /// sa progression le suit. Un album du dossier inconnu de la liste y entre.
+    fn recover(&mut self) {
+        let Some(books) = library::books_dir() else {
+            return;
+        };
+        let mut found = Vec::new();
+        library::scan(&books, 0, &mut found);
+        // Ce que dit le nom : la série et le tome, sinon le titre.
+        let id = |p: &Path| {
+            let stem = p.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+            let g = meta::guess(&stem);
+            let series = g.series.as_deref().map(meta::normalize);
+            let title = g.title.as_deref().map(meta::normalize);
+            match g.volume {
+                Some(v) => (series, Some(v), None),
+                None => (series, None, title),
+            }
+        };
+        let mut lost: Vec<PathBuf> = Vec::new();
+        for p in self.state.files.iter().chain(&self.state.recents) {
+            if p.starts_with(&books) && !p.exists() && !lost.contains(p) {
+                lost.push(p.clone());
+            }
+        }
+        let mut changed = false;
+        for old in lost {
+            let free = |f: &&PathBuf| !self.state.files.contains(*f);
+            let same_name = found
+                .iter()
+                .filter(free)
+                .find(|f| f.file_name() == old.file_name() && f.extension() == old.extension());
+            let same_id = || {
+                let mut matches = found
+                    .iter()
+                    .filter(free)
+                    .filter(|f| f.extension() == old.extension() && id(f) == id(&old));
+                // Une seule correspondance, sinon on ne devine pas.
+                matches.next().filter(|_| matches.next().is_none())
+            };
+            if let Some(new) = same_name.or_else(same_id).cloned() {
+                self.state.renamed(&old, &new);
+                changed = true;
+            }
+        }
+        let unknown: Vec<PathBuf> = found
+            .into_iter()
+            .filter(|f| !self.state.files.contains(f))
+            .collect();
+        if !unknown.is_empty() {
+            self.state.add(unknown);
+            changed = true;
+        }
+        if changed {
+            self.state.save();
+        }
     }
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
@@ -340,10 +402,11 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title("Serj".into()));
     }
 
-    /// Donne au fichier de l'album le nom trouvé en ligne (« Lanfeust de Troy -
-    /// Tome 2 - Thanos l'incongru.pdf »), à côté de l'ancien. Seulement si le
-    /// catalogue a reconnu l'album, ou si ses infos ont été corrigées à la main ;
-    /// jamais par-dessus un autre fichier.
+    /// Range l'album dans le dossier de Serj : dans le dossier de son rayon et
+    /// de sa série (« BD/Lanfeust de Troy »). Et lui donne le nom trouvé en
+    /// ligne (« Lanfeust de Troy - Tome 2 - Thanos l'incongru.pdf »), mais
+    /// seulement si le catalogue a reconnu l'album, ou si ses infos ont été
+    /// corrigées à la main. Jamais par-dessus un autre fichier.
     fn rename(&mut self, path: &Path) {
         let Some(info) = self.infos.known(path) else {
             return;
@@ -352,32 +415,39 @@ impl App {
         let trusted = self.state.correction(path).is_some()
             || info.sources.iter().any(|(source, _)| source == "BnF")
             || crate::infos::embedded(path).is_some_and(|m| m.title.is_some());
-        if !info.searched || !trusted {
+        let name = (info.searched && trusted)
+            .then(|| meta::file_name(info))
+            .flatten();
+        let books = library::books_dir().filter(|d| path.starts_with(d));
+        // Hors du dossier de Serj, un album n'est que renommé, sur place.
+        if name.is_none() && books.is_none() {
             return;
         }
-        let Some(name) = meta::file_name(info) else {
-            return;
+        let file = match name {
+            Some(name) => {
+                let extension = path
+                    .extension()
+                    .map(|e| e.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "pdf".into());
+                format!("{name}.{extension}")
+            }
+            None => match path.file_name() {
+                Some(f) => f.to_string_lossy().into_owned(),
+                None => return,
+            },
         };
-        let extension = path
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "pdf".into());
-        // Une copie de Serj se range aussi dans le dossier de sa série (un
-        // livre dans « Livres »).
-        let livre = self.state.kind(path) == Kind::Livre;
+        let kind = self.state.kind(path);
         let author = info.authors.first().map(|a| a.name.clone());
-        let dir = match library::books_dir().filter(|d| path.starts_with(d)) {
-            Some(books) => books.join(library::folder(
-                livre,
-                info.series.as_deref(),
-                author.as_deref(),
-            )),
+        let dir = match books {
+            Some(books) => {
+                books.join(library::folder(kind, info.series.as_deref(), author.as_deref()))
+            }
             None => path.parent().map(Path::to_path_buf).unwrap_or_default(),
         };
-        let target = dir.join(format!("{name}.{extension}"));
-        // Déjà bien nommé, ou un autre fichier porte ce nom (macOS ignore la
-        // casse : même nom autrement écrit compris).
-        if target == path || target.exists() || !path.exists() {
+        let target = dir.join(file);
+        // Déjà bien rangé, ou un autre fichier porte ce nom. macOS et Windows
+        // ignorent la casse : le même fichier autrement écrit se renomme.
+        if target == path || !path.exists() || (target.exists() && !same_file(path, &target)) {
             return;
         }
         if std::fs::create_dir_all(&dir).is_err() || std::fs::rename(path, &target).is_err() {
@@ -473,9 +543,8 @@ impl App {
                 .correction(book)
                 .cloned()
                 .unwrap_or_else(|| crate::infos::file_guess(book));
-            let livre = self.state.kind(book) == Kind::Livre;
             let folder = library::folder(
-                livre,
+                self.state.kind(book),
                 guess.series.as_deref(),
                 guess.authors.first().map(String::as_str),
             );
@@ -748,6 +817,25 @@ fn upload(ctx: &egui::Context, page: LoadedPage) -> Page {
     }
 }
 
+/// `a` et `b` désignent le même fichier (sur un disque qui ignore la casse :
+/// « Tome 1.pdf » et « tome 1.pdf »).
+fn same_file(a: &Path, b: &Path) -> bool {
+    let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+    if lower(a) != lower(b) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    true
+}
+
 fn ease(t: f32) -> f32 {
     // Départ et arrivée en douceur.
     if t < 0.5 {
@@ -895,6 +983,12 @@ impl App {
         }
         if !detected.is_empty() {
             self.state.save();
+        }
+        // Un PDF qui se révèle être un livre passe dans « Livres ».
+        for (path, livre) in detected {
+            if livre {
+                self.rename(&path);
+            }
         }
         for p in &self.books {
             if is_pdf(p) && !self.state.kind_known(p) && self.detecting.insert(p.clone()) {
@@ -1213,6 +1307,8 @@ impl App {
         if let Some((path, kind)) = clicks.kind {
             self.state.set_kind(&path, kind);
             self.state.save();
+            // Dans le dossier de son nouveau rayon.
+            self.rename(&path);
         }
         if let Some(id) = clicks.theme {
             self.state.theme = id.to_string();

@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use serj::{archive, document, ebook};
 
+use crate::state::Kind;
+
 /// Hauteur des couvertures rendues, en pixels.
 const COVER_HEIGHT: f32 = 480.0;
 /// Profondeur maximale de recherche dans un dossier ajouté.
@@ -230,16 +232,18 @@ impl Library {
     }
 }
 
-/// Où ranger un album dans le dossier de Serj : sous sa série (« Lanfeust de
-/// Troy »), un livre dans « Livres », sous sa série ou son auteur.
-pub fn folder(livre: bool, series: Option<&str>, author: Option<&str>) -> PathBuf {
-    let mut folder = PathBuf::new();
-    if livre {
-        folder.push("Livres");
-    }
-    let name = match livre {
-        true => series.or(author),
-        false => series,
+/// Où ranger un album dans le dossier de Serj : dans le dossier de son rayon
+/// (« BD », « Mangas », « Livres »), sous sa série (« Lanfeust de Troy ») ; un
+/// livre sans série, sous son auteur.
+pub fn folder(kind: Kind, series: Option<&str>, author: Option<&str>) -> PathBuf {
+    let mut folder = PathBuf::from(match kind {
+        Kind::Bd => "BD",
+        Kind::Manga => "Mangas",
+        Kind::Livre => "Livres",
+    });
+    let name = match kind {
+        Kind::Livre => series.or(author),
+        _ => series,
     };
     if let Some(name) = name.and_then(serj::meta::file_safe) {
         folder.push(name);
@@ -262,8 +266,7 @@ pub const EXTENSIONS: [&str; 9] = [
 
 /// Le dossier où Serj range ses copies des albums.
 pub fn books_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "Serj")?;
-    Some(dirs.data_dir().join("books"))
+    Some(crate::dirs::data()?.join("books"))
 }
 
 /// Ouvre le dossier des albums de Serj dans le Finder (l'Explorateur…).
@@ -359,9 +362,8 @@ fn copy_file(from: &Path, to: &Path, progress: &mut impl FnMut(u64)) -> std::io:
 fn download(agent: &ureq::Agent, url: &str) -> Option<egui::ColorImage> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     url.hash(&mut hasher);
-    let cached = directories::ProjectDirs::from("", "", "Serj").map(|d| {
-        d.cache_dir()
-            .join("couvertures")
+    let cached = crate::dirs::cache().map(|d| {
+        d.join("couvertures")
             .join(format!("web-{:016x}.png", hasher.finish()))
     });
     let image = match cached.as_ref().and_then(|f| image::open(f).ok()) {
@@ -447,9 +449,8 @@ fn cache_file(path: &Path) -> Option<PathBuf> {
     path.hash(&mut hasher);
     meta.len().hash(&mut hasher);
     meta.modified().ok().hash(&mut hasher);
-    let dirs = directories::ProjectDirs::from("", "", "Serj")?;
     Some(
-        dirs.cache_dir()
+        crate::dirs::cache()?
             .join("couvertures")
             .join(format!("{:016x}.png", hasher.finish())),
     )

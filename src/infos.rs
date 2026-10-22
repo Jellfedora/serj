@@ -229,9 +229,8 @@ pub fn embedded(path: &Path) -> Option<serj::ebook::Metadata> {
 fn cache_file(path: &Path) -> Option<PathBuf> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
-    let dirs = directories::ProjectDirs::from("", "", "Serj")?;
     Some(
-        dirs.cache_dir()
+        crate::dirs::cache()?
             .join("infos")
             .join(format!("{:016x}.json", hasher.finish())),
     )
@@ -316,8 +315,17 @@ impl Worker {
                 reached = true;
                 if let Some(f) = found {
                     // La série et le numéro du nom de fichier sont plus sûrs que
-                    // ceux d'une notice (« One piece magazine. Vol »).
-                    info.series = info.series.or(f.series);
+                    // ceux d'une notice (« One piece magazine. Vol ») ; mais
+                    // quand c'est la même série, la notice l'écrit avec ses
+                    // apostrophes (« l'oiseau » pour « lOiseau »).
+                    info.series = match (info.series, f.series) {
+                        (Some(ours), Some(theirs))
+                            if meta::normalize(&ours) == meta::normalize(&theirs) =>
+                        {
+                            Some(theirs)
+                        }
+                        (ours, theirs) => ours.or(theirs),
+                    };
                     info.volume = info.volume.or(f.volume);
                     // Un titre corrigé à la main reste tel quel ; celui du nom
                     // de fichier a souvent perdu ses accents et apostrophes.
@@ -394,6 +402,15 @@ impl Worker {
             match self.wikipedia(&name, kind) {
                 Ok(Some(article)) => {
                     reached = true;
+                    // Même série : l'article l'écrit comme il faut (accents,
+                    // apostrophes, majuscules), et pareil pour tous ses tomes.
+                    if info
+                        .series
+                        .as_deref()
+                        .is_some_and(|s| meta::normalize(s) == meta::normalize(&article.name))
+                    {
+                        info.series = Some(article.name.clone());
+                    }
                     if let Some(extract) = article.extract {
                         info.series_summary.get_or_insert(extract);
                     }
@@ -428,7 +445,7 @@ impl Worker {
 
     /// Les notices de la BnF, de plus en plus larges jusqu'à trouver l'album.
     fn bnf(&self, g: &Guess, manga: bool, livre: bool) -> Result<Option<meta::Found>, Failure> {
-        let clean = |s: &str| s.replace('"', " ");
+        let clean = |s: &str| meta::unglue_elisions(s).replace('"', " ");
         let author = g
             .authors
             .first()
@@ -449,9 +466,9 @@ impl Worker {
             for word in meta::keywords(title).iter().take(2) {
                 queries.push(format!("bib.title all \"{prefix} {word}\""));
             }
-            if g.series.is_none() {
-                queries.push(format!("bib.title all \"{}\"", clean(title)));
-            }
+            // Sans la série, en dernier recours : son nom a pu perdre une
+            // apostrophe que rien ne trahit (« loiseau »).
+            queries.push(format!("bib.title all \"{}\"", clean(title)));
         }
         let mut records: Vec<Record> = Vec::new();
         let mut best = None;
@@ -487,17 +504,6 @@ impl Worker {
             return Ok(found.clone());
         }
         let api = "https://fr.wikipedia.org/w/api.php";
-        let body = self.get(
-            api,
-            &[
-                ("action", "query"),
-                ("list", "search"),
-                ("srsearch", &format!("{name} {kind}")),
-                ("srlimit", "5"),
-                ("format", "json"),
-            ],
-        )?;
-        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         // Un article dont le titre est la série (« Lanfeust de Troy »,
         // « Naruto (manga) »), pas une page qui la cite.
         // Pas l'adaptation : « Harry Potter (série télévisée) », « (film) »…
@@ -517,16 +523,44 @@ impl Worker {
             .iter()
             .any(|w| qualifier.contains(w))
         };
-        let page = v["query"]["search"].as_array().and_then(|results| {
-            results
-                .iter()
-                .filter_map(|r| r["title"].as_str())
-                .find(|t| {
-                    let base = meta::normalize(t.split(" (").next().unwrap_or(t));
-                    base == key && !other_medium(t)
-                })
-        });
-        let found = match page {
+        // Le nom tel quel, puis à peu près (« loiseau~ » trouve « l'oiseau ») :
+        // un nom de fichier perd ses apostrophes.
+        let fuzzy = name
+            .split_whitespace()
+            .map(|w| match w.chars().count() >= 5 {
+                true => format!("{w}~"),
+                false => w.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut page = None;
+        for query in [name, fuzzy.as_str()] {
+            let body = self.get(
+                api,
+                &[
+                    ("action", "query"),
+                    ("list", "search"),
+                    ("srsearch", &format!("{query} {kind}")),
+                    ("srlimit", "5"),
+                    ("format", "json"),
+                ],
+            )?;
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            page = v["query"]["search"].as_array().and_then(|results| {
+                results
+                    .iter()
+                    .filter_map(|r| r["title"].as_str())
+                    .find(|t| {
+                        let base = meta::normalize(t.split(" (").next().unwrap_or(t));
+                        base == key && !other_medium(t)
+                    })
+                    .map(str::to_string)
+            });
+            if page.is_some() || fuzzy == name {
+                break;
+            }
+        }
+        let found = match page.as_deref() {
             Some(title) => {
                 let body = self.get(
                     api,
@@ -556,6 +590,7 @@ impl Worker {
                         .as_str()
                         .and_then(meta::infobox_volumes);
                     (extract.is_some() || volumes.is_some()).then(|| Article {
+                        name: title.split(" (").next().unwrap_or(title).to_string(),
                         extract,
                         link: p["fullurl"].as_str().unwrap_or(api).to_string(),
                         volumes,
@@ -657,6 +692,8 @@ impl Worker {
 
 #[derive(Clone)]
 struct Article {
+    /// Le nom de la série, sans la précision « (bande dessinée) ».
+    name: String,
     extract: Option<String>,
     link: String,
     volumes: Option<u32>,

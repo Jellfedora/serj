@@ -175,8 +175,7 @@ impl Default for State {
 const MAX_RECENTS: usize = 12;
 
 fn file() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "Serj")?;
-    Some(dirs.config_dir().join("state.json"))
+    Some(crate::dirs::config()?.join("state.json"))
 }
 
 impl State {
