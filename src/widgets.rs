@@ -218,6 +218,8 @@ pub enum Icon {
     Panels,
     /// Lecture page entière.
     Page,
+    /// Le voile autour de la case : une planche assombrie, la case claire.
+    Dim,
     /// Manga : de droite à gauche.
     RightToLeft,
     Minus,
@@ -299,6 +301,21 @@ pub fn icon(painter: &egui::Painter, icon: Icon, c: Pos2, s: f32, color: Color32
             for r in [left, right] {
                 painter.rect_stroke(r, 1.5, stroke, egui::StrokeKind::Inside);
             }
+        }
+        Icon::Dim => {
+            let page = Rect::from_center_size(c, vec2(s * 0.7, s * 0.86));
+            let hole = Rect::from_center_size(c, vec2(s * 0.34, s * 0.3));
+            let veil = color.gamma_multiply(0.45);
+            for r in [
+                Rect::from_min_max(page.min, pos2(page.max.x, hole.min.y)),
+                Rect::from_min_max(pos2(page.min.x, hole.max.y), page.max),
+                Rect::from_min_max(pos2(page.min.x, hole.min.y), pos2(hole.min.x, hole.max.y)),
+                Rect::from_min_max(pos2(hole.max.x, hole.min.y), pos2(page.max.x, hole.max.y)),
+            ] {
+                painter.rect_filled(r, 0.0, veil);
+            }
+            painter.rect_stroke(page, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.rect_stroke(hole, 1.0, stroke, egui::StrokeKind::Middle);
         }
         Icon::Page => {
             let page = Rect::from_center_size(c, vec2(s * 0.7, s * 0.86));

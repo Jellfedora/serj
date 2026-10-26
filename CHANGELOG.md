@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.0]
+
+- Case par case, les petites cases ne sont plus agrandies jusqu'à pixeliser : elles restent à l'échelle de la planche, à peu près la taille d'un album tenu en main. « Agrandir » (la loupe de la barre du haut, ou E) les remet à la taille de l'écran.
+- Le voile sombre autour de la case s'enlève : bouton « Voile » de la barre du haut, ou V.
+- Ces deux choix sont aussi dans les réglages (« Lecture des BD et mangas ») et retenus d'une fois sur l'autre.
+
 ## [0.7.0]
 
 - Une bulle ou un cartouche à cheval sur deux cases n'est plus coupé : chaque case qui en porte au moins le tiers le montre en entier.

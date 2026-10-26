@@ -31,6 +31,8 @@ l'installe depuis sa page Téléchargements. Il marche aussi tout seul.
 | ← ↑, clic dans le tiers gauche | case précédente |
 | Barre du bas | aller à une page |
 | P | page entière |
+| E | case par case : cases agrandies à la taille de l'écran, ou gardées à l'échelle de la planche (par défaut, pour ne pas pixeliser les petites cases) |
+| V | case par case : enlever ou remettre le voile sombre autour de la case |
 | A | lecture automatique (5 s par case par défaut) |
 | − / + | moins / plus de temps par case en lecture automatique ; dans un livre, texte plus petit / plus grand |
 | Glisser la page d'un livre | tourner la page |

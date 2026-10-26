@@ -85,6 +85,11 @@ pub struct State {
     pub positions: BTreeMap<String, Position>,
     /// Lecture page entière plutôt que case par case.
     pub whole_page: bool,
+    /// Case par case : chaque case agrandie jusqu'à remplir l'écran, plutôt
+    /// que gardée à peu près à la taille de la planche.
+    pub panel_zoom: bool,
+    /// Case par case : le reste de la planche assombri autour de la case.
+    pub panel_dim: bool,
     /// Dossiers ajoutés avant que Serj copie les albums : leurs PDF sont
     /// copiés au démarrage, puis la liste est vidée.
     pub folders: Vec<PathBuf>,
@@ -158,6 +163,8 @@ impl Default for State {
             recents: Vec::new(),
             positions: BTreeMap::new(),
             whole_page: false,
+            panel_zoom: false,
+            panel_dim: true,
             folders: Vec::new(),
             files: Vec::new(),
             auto_secs: 5.0,

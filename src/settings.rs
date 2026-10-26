@@ -173,6 +173,29 @@ fn general(ui: &mut egui::Ui, state: &mut State, out: &mut Outcome) {
     });
 
     ui.add_space(24.0);
+    heading(ui, "Lecture des BD et mangas");
+    let before = (state.panel_zoom, state.panel_dim);
+    egui::Grid::new("cases")
+        .num_columns(2)
+        .spacing([18.0, 12.0])
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("Taille des cases").color(theme().muted));
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut state.panel_zoom, false, "À l'échelle de la planche");
+                ui.radio_value(&mut state.panel_zoom, true, "Agrandies à l'écran");
+            });
+            ui.end_row();
+            ui.label(egui::RichText::new("Autour de la case").color(theme().muted));
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut state.panel_dim, true, "Planche assombrie");
+                ui.radio_value(&mut state.panel_dim, false, "Planche telle quelle");
+            });
+            ui.end_row();
+        });
+    out.changed |= (state.panel_zoom, state.panel_dim) != before;
+    hint(ui, "Aussi pendant la lecture : E pour la taille, V pour le voile.");
+
+    ui.add_space(24.0);
     heading(ui, "Lecture des livres");
     let before = state.typography;
     let t = &mut state.typography;

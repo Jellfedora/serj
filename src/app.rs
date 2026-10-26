@@ -35,6 +35,10 @@ const HUD_SECS: f64 = 2.2;
 /// Zoom maximal, et celui de la touche Z.
 const MAX_ZOOM: f32 = 6.0;
 const KEY_ZOOM: f32 = 2.5;
+/// Case par case, à l'échelle : une case n'est pas montrée plus grande que la
+/// planche entière à l'écran multipliée par ceci (à peu près la taille d'un
+/// album tenu en main), pour ne pas pixeliser les petites cases.
+const PANEL_SCALE: f32 = 1.6;
 /// Délais proposés pour la lecture automatique, en secondes.
 const AUTO_STEPS: [f64; 12] = [
     2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0,
@@ -102,6 +106,10 @@ struct Actions {
     jump: Option<usize>,
     toggle_page: bool,
     toggle_manga: bool,
+    /// Cases agrandies à l'écran, ou à l'échelle de la planche.
+    toggle_panel_zoom: bool,
+    /// Le voile sombre autour de la case.
+    toggle_panel_dim: bool,
     toggle_auto: bool,
     /// Moins (ou plus) de temps par case en lecture automatique.
     faster: bool,
@@ -2962,6 +2970,8 @@ impl App {
                 last: any(&[Key::End]),
                 toggle_page: any(&[Key::P]),
                 toggle_manga: any(&[Key::M]),
+                toggle_panel_zoom: any(&[Key::E]),
+                toggle_panel_dim: any(&[Key::V]),
                 toggle_auto: any(&[Key::A]),
                 faster: any(&[Key::Minus]),
                 slower: any(&[Key::Plus, Key::Equals]),
@@ -3048,7 +3058,11 @@ impl App {
             let page = book.current().expect("page rendue");
             // La caméra remplit l'écran (moins une marge), centrée.
             let room = area.shrink(SCREEN_MARGIN);
-            let fit = (room.width() / camera.width()).min(room.height() / camera.height());
+            let mut fit = (room.width() / camera.width()).min(room.height() / camera.height());
+            if !whole_page && !self.state.panel_zoom {
+                let page_fit = (room.width() / page.size.x).min(room.height() / page.size.y);
+                fit = fit.min(page_fit * PANEL_SCALE);
+            }
 
             // Le zoom : pincement, ⌘ molette ou clavier, vers le pointeur ;
             // puis on fait glisser la vue.
@@ -3133,7 +3147,7 @@ impl App {
                     painter.image(page.texture.id(), page_rect, uv, Color32::WHITE);
                 }
             }
-            if !whole_page {
+            if !whole_page && self.state.panel_dim {
                 // Le reste de la planche, assombri autour de la case.
                 let hole = Rect::from_min_max(to_screen(camera.min), to_screen(camera.max));
                 for r in [
@@ -3346,6 +3360,29 @@ impl App {
                             .on_hover_text("Case par case (P)");
                     a.toggle_page =
                         (page.clicked() && !whole_page) || (panels.clicked() && whole_page);
+                    if !whole_page {
+                        let tip = if self.state.panel_zoom {
+                            "Cases agrandies à la taille de l'écran ; recliquer pour les garder à l'échelle de la planche (E)"
+                        } else {
+                            "Cases à l'échelle de la planche ; cliquer pour les agrandir à la taille de l'écran (E)"
+                        };
+                        a.toggle_panel_zoom = widgets::button(
+                            ui,
+                            Some(Icon::Search),
+                            label("Agrandir"),
+                            tone(self.state.panel_zoom),
+                        )
+                        .on_hover_text(tip)
+                        .clicked();
+                        a.toggle_panel_dim = widgets::button(
+                            ui,
+                            Some(Icon::Dim),
+                            label("Voile"),
+                            tone(self.state.panel_dim),
+                        )
+                        .on_hover_text("Assombrir la planche autour de la case (V)")
+                        .clicked();
+                    }
                     ui.add_space(10.0);
                 }
                 a.slower = widgets::button(ui, Some(Icon::Plus), "", Tone::Plain)
@@ -3473,6 +3510,14 @@ impl App {
                 book.glide(From::Rect(here), MOVE_SECS);
             }
         }
+        let toggle_panel_zoom = a.toggle_panel_zoom && !book.livre && !whole_page;
+        if toggle_panel_zoom {
+            self.state.panel_zoom = !self.state.panel_zoom;
+        }
+        let toggle_panel_dim = a.toggle_panel_dim && !book.livre && !whole_page;
+        if toggle_panel_dim {
+            self.state.panel_dim = !self.state.panel_dim;
+        }
         if a.toggle_manga && !book.livre {
             book.set_manga(!book.position.manga, now, whole_page);
         }
@@ -3510,11 +3555,17 @@ impl App {
                     .unwrap_or(secs)
             };
         }
-        if moved || a.toggle_page || a.toggle_manga {
+        if moved || a.toggle_page || a.toggle_manga || toggle_panel_zoom {
             self.zoom = 1.0;
             self.pan = Vec2::ZERO;
         }
-        let changed = moved || a.toggle_page || a.toggle_manga || a.faster || a.slower;
+        let changed = moved
+            || a.toggle_page
+            || a.toggle_manga
+            || toggle_panel_zoom
+            || toggle_panel_dim
+            || a.faster
+            || a.slower;
         if changed {
             self.state_dirty_since.get_or_insert(now);
         }
@@ -3540,6 +3591,8 @@ impl Actions {
         self.jump = self.jump.or(other.jump);
         self.toggle_page |= other.toggle_page;
         self.toggle_manga |= other.toggle_manga;
+        self.toggle_panel_zoom |= other.toggle_panel_zoom;
+        self.toggle_panel_dim |= other.toggle_panel_dim;
         self.toggle_auto |= other.toggle_auto;
         self.faster |= other.faster;
         self.slower |= other.slower;
